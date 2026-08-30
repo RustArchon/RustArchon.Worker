@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk.Worker">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UserSecretsId>rustarchon-worker-5e2a8b1c-4d6f-4a9e-8c3b-7f1d9a2e6b4c</UserSecretsId>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Http" Version="10.0.0" />
+    <!-- Pinned to the last open-source MassTransit release - v9 is commercial. See README. -->
+    <PackageReference Include="MassTransit" Version="[8.5.10]" />
+    <PackageReference Include="MassTransit.RabbitMQ" Version="[8.5.10]" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\RustArchon.Messaging\RustArchon.Messaging.csproj" />
+    <ProjectReference Include="..\RustArchon.Rcon\RustArchon.Rcon.csproj" />
+  </ItemGroup>
+
+</Project>
