@@ -4,8 +4,12 @@ using MassTransit;
 using Microsoft.Extensions.Logging;
 using RustArchon.Messaging.Contracts;
 using RustArchon.Rcon;
+using RustArchon.Rcon.Entities;
 using RustArchon.Rcon.EventArgs;
+using RustArchon.Rcon.KillFeed;
+using RustArchon.Rcon.PlayerEvents;
 using RustArchon.Worker.Configuration;
+using System.Text.Json;
 
 namespace RustArchon.Worker.Connections;
 
@@ -24,6 +28,27 @@ public sealed class ServerConnectionActor : IAsyncDisposable
     private static readonly TimeSpan HeartbeatInterval = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan DefaultCommandTimeout = TimeSpan.FromSeconds(8);
 
+    // Confirmed live: Rust's playerlist JSON uses "SteamID"/"OwnerSteamID" (capital ID), but
+    // RustArchon.Rcon's Player class - matching the rest of this codebase's naming - has
+    // SteamId/OwnerSteamId. System.Text.Json's default deserialization is case-sensitive, so without
+    // this, every Player.SteamId silently comes back "" (the field's default), which broke
+    // ReconcilePlayerListAsync's SteamId-keyed diff in a nasty way: it read as "nobody is online" on
+    // every poll regardless of who actually was, which - since diffing against an empty set makes
+    // everyone in _lastKnownPlayers look newly disconnected - spuriously disconnected every real
+    // player shortly after they connected. Caught live: a player who joined and stayed online got
+    // marked disconnected in PlayerSession ~45s later, right on the next poll.
+    private static readonly JsonSerializerOptions PlayerListJsonOptions = new() { PropertyNameCaseInsensitive = true };
+
+    // Confirmed live against a real production server: Rust's console emits an immediate, reliable
+    // "<ip>:<port>/<steamId>/<name> joined [...]" / "... disconnecting: <reason>" line for every
+    // connect/disconnect (see PlayerConnectionTextParser's remarks) - OnRawMessageReceived below
+    // parses these the moment they arrive, the same way it already does for the kill feed, so that's
+    // now the primary detection path. PlayerListPollLoopAsync is kept as a slower reconciliation
+    // safety net (catches a missed/garbled line, or - the one case text parsing can never cover -
+    // everyone already online when this actor starts, since there's no console line for "was already
+    // here"), not the thing detection latency depends on, hence the more relaxed interval.
+    private static readonly TimeSpan PlayerListPollInterval = TimeSpan.FromSeconds(60);
+
     private readonly Guid _tenantId;
     private readonly Guid _workerId;
     private readonly IPublishEndpoint _publishEndpoint;
@@ -32,6 +57,17 @@ public sealed class ServerConnectionActor : IAsyncDisposable
 
     private readonly CancellationTokenSource _lifetimeCts = new();
     private readonly Task _heartbeatLoopTask;
+    private readonly Task _playerListPollLoopTask;
+
+    // Actor-local, not persisted - rebuilt from scratch every time this actor starts (a fresh worker
+    // claim, or this same worker reconnecting after a restart). See PlayerListPollLoopAsync's remarks
+    // for the one real consequence of that: everyone already online at that moment gets reported as a
+    // fresh "connect" on the very first poll, since there's no prior snapshot to diff against.
+    // Written from two different call paths that can run concurrently - the WebSocket client's own
+    // receive loop (OnRawMessageReceived) and this actor's poll loop task - so every access goes
+    // through _lastKnownPlayersLock.
+    private readonly Dictionary<string, Player> _lastKnownPlayers = new();
+    private readonly object _lastKnownPlayersLock = new();
 
     public ServerConnectionActor(
         Guid serverId,
@@ -62,6 +98,7 @@ public sealed class ServerConnectionActor : IAsyncDisposable
         _client.MessageReceived += OnRawMessageReceived;
 
         _heartbeatLoopTask = Task.Run(() => HeartbeatLoopAsync(_lifetimeCts.Token));
+        _playerListPollLoopTask = Task.Run(() => PlayerListPollLoopAsync(_lifetimeCts.Token));
 
         _ = PublishStatusAsync(RconConnectionStatus.Connecting, null, CancellationToken.None);
         if (!_client.Connect())
@@ -101,7 +138,22 @@ public sealed class ServerConnectionActor : IAsyncDisposable
     private void OnConnectionChanged(object? sender, ConnectionChangedEventArgs e)
     {
         var status = e.IsConnected ? RconConnectionStatus.Connected : RconConnectionStatus.Reconnecting;
-        var detail = e.IsConnected ? null : "Connection lost - retrying automatically";
+
+        if (e.IsConnected)
+        {
+            _logger.LogInformation("Connected to server {ServerId} ({Detail})", ServerId, e.Detail);
+            _ = PublishStatusAsync(status, null, CancellationToken.None);
+            return;
+        }
+
+        // Previously a hardcoded generic message regardless of cause, which made a genuinely stuck
+        // reconnect (Websocket.Client retrying every ErrorReconnectTimeout but never succeeding, even
+        // though the server itself is reachable - confirmed live via a second, unrelated RCON client
+        // staying connected throughout) indistinguishable from a normal transient blip until now.
+        _logger.LogWarning(e.Exception, "Lost connection to server {ServerId} ({Detail})", ServerId, e.Detail);
+        var detail = e.Detail is null
+            ? "Connection lost - retrying automatically"
+            : $"Connection lost ({e.Detail}) - retrying automatically";
         _ = PublishStatusAsync(status, detail, CancellationToken.None);
     }
 
@@ -116,6 +168,84 @@ public sealed class ServerConnectionActor : IAsyncDisposable
             response.Type,
             response.Message,
             response.Stacktrace));
+
+        // Every frame is a candidate death line - see KillFeedTextParser's remarks for why this can't
+        // be narrowed to "only generic console frames" up front (the Type field's meaning isn't
+        // reliably documented). Non-matches (the overwhelming majority of frames) are just a cheap
+        // pair of regex misses. Only published when a player is actually involved on either side -
+        // NPC-vs-NPC/environmental noise (e.g. a helicopter's own scripted kills) isn't what RustArchon
+        // tracks player history for.
+        if (KillFeedTextParser.TryParse(response.Message, out var kill) && kill is not null
+            && (kill.VictimSteamId is not null || kill.KillerSteamId is not null))
+        {
+            _ = _publishEndpoint.Publish(new PlayerKilled(
+                ServerId,
+                _tenantId,
+                DateTimeOffset.UtcNow,
+                kill.VictimName,
+                kill.VictimSteamId,
+                kill.KillerName,
+                kill.KillerSteamId,
+                kill.Weapon,
+                response.Message));
+        }
+
+        // Every frame is also a candidate join/leave line - see PlayerConnectionTextParser's remarks.
+        // This is now the primary way ReconcilePlayerListAsync's dictionary gets updated; the poll
+        // loop just double-checks it periodically rather than being the detection path itself.
+        if (PlayerConnectionTextParser.TryParse(response.Message, out var connectionEvent) && connectionEvent is not null)
+        {
+            HandleConnectionEvent(connectionEvent);
+        }
+    }
+
+    private void HandleConnectionEvent(PlayerConnectionEvent connectionEvent)
+    {
+        var now = DateTimeOffset.UtcNow;
+        bool publishConnect;
+        bool publishDisconnect;
+
+        lock (_lastKnownPlayersLock)
+        {
+            if (connectionEvent.Type == PlayerConnectionEventType.Connected)
+            {
+                // Guards against a duplicate "joined" line (seen once already: some console spam
+                // repeats under load) re-publishing a second PlayerConnected for someone already
+                // tracked.
+                publishConnect = !_lastKnownPlayers.ContainsKey(connectionEvent.SteamId);
+                publishDisconnect = false;
+
+                if (publishConnect)
+                {
+                    _lastKnownPlayers[connectionEvent.SteamId] = new Player
+                    {
+                        SteamId = connectionEvent.SteamId,
+                        DisplayName = connectionEvent.DisplayName ?? connectionEvent.SteamId,
+                        Address = connectionEvent.IpAddress ?? string.Empty
+                    };
+                }
+            }
+            else
+            {
+                publishDisconnect = _lastKnownPlayers.Remove(connectionEvent.SteamId);
+                publishConnect = false;
+            }
+        }
+
+        if (publishConnect)
+        {
+            _ = _publishEndpoint.Publish(new PlayerConnected(
+                ServerId,
+                _tenantId,
+                connectionEvent.SteamId,
+                connectionEvent.DisplayName ?? connectionEvent.SteamId,
+                connectionEvent.IpAddress ?? string.Empty,
+                now));
+        }
+        else if (publishDisconnect)
+        {
+            _ = _publishEndpoint.Publish(new PlayerDisconnected(ServerId, _tenantId, connectionEvent.SteamId, now));
+        }
     }
 
     private async Task HeartbeatLoopAsync(CancellationToken cancellationToken)
@@ -150,6 +280,121 @@ public sealed class ServerConnectionActor : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Polls <c>playerlist</c> on a fixed interval and diffs the result against
+    /// <see cref="_lastKnownPlayers"/> to derive any <see cref="PlayerConnected"/>/
+    /// <see cref="PlayerDisconnected"/> events that text-based detection in
+    /// <see cref="OnRawMessageReceived"/> missed.
+    /// </summary>
+    /// <remarks>
+    /// No longer the primary detection path (see <see cref="PlayerListPollInterval"/>'s remarks) - the
+    /// one thing this still covers that text parsing structurally can't is someone already online at
+    /// the moment this actor starts: there's no console line for "was already here" to parse, so the
+    /// very first poll is what discovers them (and, since there's no prior snapshot to diff against
+    /// on that first poll, they appear as a fresh connect rather than "already connected").
+    /// </remarks>
+    private async Task PlayerListPollLoopAsync(CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                await Task.Delay(PlayerListPollInterval, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+
+            List<Player> currentPlayers;
+            try
+            {
+                // raiseMessageReceived: false - this is RustArchon's own internal reconciliation
+                // check, not something the user ran, so its response shouldn't join the server's
+                // actual console/chat history (see RustWebRconClient.SendCommandAsync's remarks). A
+                // user-run "playerlist" from the Console tab goes through SendCommandAsync below with
+                // the default (true) and does show up, same as any other command they send.
+                var response = await _client.SendCommandAsync(
+                    "playerlist", DefaultCommandTimeout, cancellationToken, raiseMessageReceived: false);
+                currentPlayers = JsonSerializer.Deserialize<List<Player>>(response.Message, PlayerListJsonOptions) ?? new List<Player>();
+            }
+            catch (InvalidOperationException)
+            {
+                continue; // Not connected right now - the next successful poll picks up from there.
+            }
+            catch (TimeoutException)
+            {
+                continue; // No response in time - treated the same as "not connected right now".
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Player-list poll failed for server {ServerId}", ServerId);
+                continue;
+            }
+
+            try
+            {
+                await ReconcilePlayerListAsync(currentPlayers, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to reconcile player list for server {ServerId}", ServerId);
+            }
+        }
+    }
+
+    private async Task ReconcilePlayerListAsync(List<Player> currentPlayers, CancellationToken cancellationToken)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var currentBySteamId = currentPlayers
+            .Where(p => !string.IsNullOrEmpty(p.SteamId))
+            .ToDictionary(p => p.SteamId);
+
+        List<string> newlyConnected;
+        List<string> newlyDisconnected;
+
+        // Snapshot the diff and update the dictionary under one lock, then publish outside it - this
+        // is the same dictionary OnRawMessageReceived's text-based detection reads/writes concurrently
+        // (see _lastKnownPlayersLock's remarks), and in the steady state this should find nothing to
+        // do at all, since text detection already handled it the moment the console line arrived.
+        lock (_lastKnownPlayersLock)
+        {
+            newlyConnected = currentBySteamId.Keys.Except(_lastKnownPlayers.Keys).ToList();
+            newlyDisconnected = _lastKnownPlayers.Keys.Except(currentBySteamId.Keys).ToList();
+
+            _lastKnownPlayers.Clear();
+            foreach (var (steamId, player) in currentBySteamId)
+            {
+                _lastKnownPlayers[steamId] = player;
+            }
+        }
+
+        foreach (var steamId in newlyConnected)
+        {
+            var player = currentBySteamId[steamId];
+            await _publishEndpoint.Publish(
+                new PlayerConnected(ServerId, _tenantId, steamId, player.DisplayName, player.Address, now),
+                cancellationToken);
+        }
+
+        foreach (var steamId in newlyDisconnected)
+        {
+            await _publishEndpoint.Publish(
+                new PlayerDisconnected(ServerId, _tenantId, steamId, now),
+                cancellationToken);
+        }
+
+        // Every currently-known player, not just newly-connected ones - ping and Rust's own
+        // anti-cheat violation level are only ever visible via this poll, never the console join line,
+        // so this is the only way an open session's "last known" values for either ever get updated.
+        foreach (var (steamId, player) in currentBySteamId)
+        {
+            await _publishEndpoint.Publish(
+                new PlayerSessionSnapshotUpdated(ServerId, _tenantId, steamId, player.Ping, player.ViolationLevel, now),
+                cancellationToken);
+        }
+    }
+
     private async Task PublishStatusAsync(RconConnectionStatus status, string? detail, CancellationToken cancellationToken)
     {
         try
@@ -171,6 +416,15 @@ public sealed class ServerConnectionActor : IAsyncDisposable
         try
         {
             await _heartbeatLoopTask;
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected on shutdown.
+        }
+
+        try
+        {
+            await _playerListPollLoopTask;
         }
         catch (OperationCanceledException)
         {
