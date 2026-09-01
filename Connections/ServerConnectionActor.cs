@@ -96,6 +96,7 @@ public sealed class ServerConnectionActor : IAsyncDisposable
             errorReconnectTimeout: reconnectOptions.ErrorReconnectTimeout);
         _client.ConnectionChanged += OnConnectionChanged;
         _client.MessageReceived += OnRawMessageReceived;
+        _client.ProcessingError += OnProcessingError;
 
         _heartbeatLoopTask = Task.Run(() => HeartbeatLoopAsync(_lifetimeCts.Token));
         _playerListPollLoopTask = Task.Run(() => PlayerListPollLoopAsync(_lifetimeCts.Token));
@@ -133,6 +134,19 @@ public sealed class ServerConnectionActor : IAsyncDisposable
         {
             return new RconCommandResult(false, null, null, null, "Timeout");
         }
+    }
+
+    /// <summary>
+    /// Reports an exception <see cref="RustWebRconClient"/> caught while processing an inbound frame
+    /// or connection-state transition - see its <c>ProcessingError</c> remarks. This is what makes a
+    /// bug in this actor's own event handlers (<see cref="OnRawMessageReceived"/>,
+    /// <see cref="OnConnectionChanged"/>) visible instead of silently turning into an endless reconnect
+    /// loop the way it did before that safety net existed - confirmed live as the actual root cause of
+    /// one such loop.
+    /// </summary>
+    private void OnProcessingError(object? sender, Exception e)
+    {
+        _logger.LogError(e, "Error processing an inbound frame or connection-state change for server {ServerId} - the frame/transition was dropped, connection unaffected", ServerId);
     }
 
     private void OnConnectionChanged(object? sender, ConnectionChangedEventArgs e)
@@ -433,6 +447,7 @@ public sealed class ServerConnectionActor : IAsyncDisposable
 
         _client.ConnectionChanged -= OnConnectionChanged;
         _client.MessageReceived -= OnRawMessageReceived;
+        _client.ProcessingError -= OnProcessingError;
         _client.Dispose();
 
         _lifetimeCts.Dispose();
