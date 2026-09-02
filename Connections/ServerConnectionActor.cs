@@ -49,6 +49,26 @@ public sealed class ServerConnectionActor : IAsyncDisposable
     // here"), not the thing detection latency depends on, hence the more relaxed interval.
     private static readonly TimeSpan PlayerListPollInterval = TimeSpan.FromSeconds(60);
 
+    // Drives the Stats tab's graphs (player count, network in/out, memory) - see
+    // ServerInfoSnapshotCaptured's remarks for why only these fields are persisted at all. 60s matches
+    // PlayerListPollInterval's cadence: frequent enough for a meaningful trend line, infrequent enough
+    // that a busy tenant's snapshot table doesn't grow unreasonably fast (1,440 rows/server/day).
+    private static readonly TimeSpan ServerInfoPollInterval = TimeSpan.FromSeconds(60);
+
+    // Only the fields ServerInfoSnapshotCaptured actually carries - deliberately not the full
+    // RustArchon.Rcon.Entities.ServerInfo shape. That type's GameTime/SaveCreatedTime use a
+    // non-ISO date format requiring ServerInfoParser's custom DateTimeConverter (see ParserBase) to
+    // deserialize; since this poll never touches those fields, leaving them off this local type
+    // altogether sidesteps that entirely - System.Text.Json just ignores the extra JSON properties.
+    private sealed class ServerInfoPollResult
+    {
+        public int Players { get; set; }
+        public int MaxPlayers { get; set; }
+        public int NetworkIn { get; set; }
+        public int NetworkOut { get; set; }
+        public int Memory { get; set; }
+    }
+
     private readonly Guid _tenantId;
     private readonly Guid _workerId;
     private readonly IPublishEndpoint _publishEndpoint;
@@ -58,6 +78,7 @@ public sealed class ServerConnectionActor : IAsyncDisposable
     private readonly CancellationTokenSource _lifetimeCts = new();
     private readonly Task _heartbeatLoopTask;
     private readonly Task _playerListPollLoopTask;
+    private readonly Task _serverInfoPollLoopTask;
 
     // Actor-local, not persisted - rebuilt from scratch every time this actor starts (a fresh worker
     // claim, or this same worker reconnecting after a restart). See PlayerListPollLoopAsync's remarks
@@ -100,6 +121,7 @@ public sealed class ServerConnectionActor : IAsyncDisposable
 
         _heartbeatLoopTask = Task.Run(() => HeartbeatLoopAsync(_lifetimeCts.Token));
         _playerListPollLoopTask = Task.Run(() => PlayerListPollLoopAsync(_lifetimeCts.Token));
+        _serverInfoPollLoopTask = Task.Run(() => ServerInfoPollLoopAsync(_lifetimeCts.Token));
 
         _ = PublishStatusAsync(RconConnectionStatus.Connecting, null, CancellationToken.None);
         if (!_client.Connect())
@@ -409,6 +431,67 @@ public sealed class ServerConnectionActor : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Polls <c>serverinfo</c> on a fixed interval and publishes <see cref="ServerInfoSnapshotCaptured"/>
+    /// with the fields worth graphing over time - see that record's remarks.
+    /// </summary>
+    private async Task ServerInfoPollLoopAsync(CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                await Task.Delay(ServerInfoPollInterval, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+
+            ServerInfoPollResult? info;
+            try
+            {
+                // raiseMessageReceived: false - same reasoning as the playerlist poll above: this is
+                // RustArchon's own internal telemetry capture, not something a user ran, so it
+                // shouldn't join the server's actual console history.
+                var response = await _client.SendCommandAsync(
+                    "serverinfo", DefaultCommandTimeout, cancellationToken, raiseMessageReceived: false);
+                info = JsonSerializer.Deserialize<ServerInfoPollResult>(response.Message);
+            }
+            catch (InvalidOperationException)
+            {
+                continue; // Not connected right now - the next successful poll picks up from there.
+            }
+            catch (TimeoutException)
+            {
+                continue; // No response in time - treated the same as "not connected right now".
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "serverinfo poll failed for server {ServerId}", ServerId);
+                continue;
+            }
+
+            if (info is null)
+            {
+                continue;
+            }
+
+            try
+            {
+                await _publishEndpoint.Publish(
+                    new ServerInfoSnapshotCaptured(
+                        ServerId, _tenantId, info.Players, info.MaxPlayers, info.NetworkIn, info.NetworkOut,
+                        info.Memory, DateTimeOffset.UtcNow),
+                    cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to publish serverinfo snapshot for server {ServerId}", ServerId);
+            }
+        }
+    }
+
     private async Task PublishStatusAsync(RconConnectionStatus status, string? detail, CancellationToken cancellationToken)
     {
         try
@@ -439,6 +522,15 @@ public sealed class ServerConnectionActor : IAsyncDisposable
         try
         {
             await _playerListPollLoopTask;
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected on shutdown.
+        }
+
+        try
+        {
+            await _serverInfoPollLoopTask;
         }
         catch (OperationCanceledException)
         {
