@@ -29,31 +29,55 @@ public class ConnectionSupervisor(
 {
     private readonly ConcurrentDictionary<Guid, ServerConnectionActor> _actors = new();
 
+    // Guards the whole check-remove-create-register sequence in StartOrRestartAsync below. Without
+    // this, two ConnectToServer messages for the same server landing close together (the periodic
+    // ServerClaimSweepService sweep racing a redelivered/duplicate message, say) can both pass
+    // ConnectToServerConsumer's own TryGetActor pre-check before either has registered an actor here -
+    // that check-then-act gap spans a real network round trip (GetServerAsync), not a tight window.
+    // Both would then reach here, each construct its own ServerConnectionActor (each opening a real
+    // RCON socket) and each write to _actors[serverId] - the loser's assignment is silently
+    // overwritten, but its actor and socket are never disposed, leaking a second, untracked connection
+    // to the same server that nothing ever stops or refreshes again. Confirmed live: this is exactly
+    // what "Started connection"/"Connected to server" logging twice for one server id, back to back,
+    // looks like - not a log duplication artifact. One process-wide semaphore is enough (this only
+    // fires on a claim or a credential refresh, never a hot path), and it makes a losing racer just a
+    // harmless redundant reconnect instead of an orphaned socket - the second call through still sees
+    // the first's already-registered actor in _actors and tears it down cleanly before replacing it.
+    private readonly SemaphoreSlim _startLock = new(1, 1);
+
     /// <inheritdoc />
     public bool TryGetActor(Guid serverId, out ServerConnectionActor actor) => _actors.TryGetValue(serverId, out actor!);
 
     /// <inheritdoc />
     public async Task StartOrRestartAsync(Guid serverId, Guid tenantId, string host, int port, string rconPassword, CancellationToken cancellationToken)
     {
-        if (_actors.TryRemove(serverId, out var existing))
+        await _startLock.WaitAsync(cancellationToken);
+        try
         {
-            logger.LogInformation("Replacing existing connection for server {ServerId} with refreshed connection details", serverId);
-            await existing.DisposeAsync();
+            if (_actors.TryRemove(serverId, out var existing))
+            {
+                logger.LogInformation("Replacing existing connection for server {ServerId} with refreshed connection details", serverId);
+                await existing.DisposeAsync();
+            }
+
+            var actor = new ServerConnectionActor(
+                serverId,
+                tenantId,
+                host,
+                port,
+                rconPassword,
+                workerIdentity.Id,
+                bus,
+                reconnectOptions.Value,
+                loggerFactory.CreateLogger<ServerConnectionActor>());
+
+            _actors[serverId] = actor;
+            logger.LogInformation("Started connection for server {ServerId}", serverId);
         }
-
-        var actor = new ServerConnectionActor(
-            serverId,
-            tenantId,
-            host,
-            port,
-            rconPassword,
-            workerIdentity.Id,
-            bus,
-            reconnectOptions.Value,
-            loggerFactory.CreateLogger<ServerConnectionActor>());
-
-        _actors[serverId] = actor;
-        logger.LogInformation("Started connection for server {ServerId}", serverId);
+        finally
+        {
+            _startLock.Release();
+        }
     }
 
     /// <inheritdoc />
