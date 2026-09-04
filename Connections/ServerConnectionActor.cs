@@ -49,7 +49,7 @@ public sealed class ServerConnectionActor : IAsyncDisposable
     // here"), not the thing detection latency depends on, hence the more relaxed interval.
     private static readonly TimeSpan PlayerListPollInterval = TimeSpan.FromSeconds(60);
 
-    // Drives the Stats tab's graphs (player count, network in/out, memory) - see
+    // Drives the Stats tab's graphs (player count, network in/out, memory, framerate) - see
     // ServerInfoSnapshotCaptured's remarks for why only these fields are persisted at all. 60s matches
     // PlayerListPollInterval's cadence: frequent enough for a meaningful trend line, infrequent enough
     // that a busy tenant's snapshot table doesn't grow unreasonably fast (1,440 rows/server/day).
@@ -67,6 +67,7 @@ public sealed class ServerConnectionActor : IAsyncDisposable
         public int NetworkIn { get; set; }
         public int NetworkOut { get; set; }
         public int Memory { get; set; }
+        public decimal Framerate { get; set; }
     }
 
     private readonly Guid _tenantId;
@@ -123,12 +124,21 @@ public sealed class ServerConnectionActor : IAsyncDisposable
         _playerListPollLoopTask = Task.Run(() => PlayerListPollLoopAsync(_lifetimeCts.Token));
         _serverInfoPollLoopTask = Task.Run(() => ServerInfoPollLoopAsync(_lifetimeCts.Token));
 
-        _ = PublishStatusAsync(RconConnectionStatus.Connecting, null, CancellationToken.None);
-        if (!_client.Connect())
+        _ = PublishStatusAsync(RconConnectionStatus.Connecting, $"Connecting to {host}:{port}", CancellationToken.None);
+        if (!_client.Connect(out var startException))
         {
             // Not fatal - Websocket.Client keeps retrying on its own regardless of whether the very
-            // first attempt threw synchronously. See RustWebRconClient.Connect's remarks.
-            _logger.LogWarning("Initial connection attempt to server {ServerId} did not start cleanly; the client will keep retrying on its own", serverId);
+            // first attempt threw synchronously. See RustWebRconClient.Connect's remarks. Previously
+            // only ever logged locally, same gap as Socket_OnClose's exception used to be - the status
+            // published here was nothing at all, leaving the Panel showing "Connecting" indefinitely
+            // with no indication anything had actually gone wrong. RconConnectionStatus.Error, not
+            // Reconnecting: this is "never got a connection going in the first place", a genuinely
+            // worse state than the normal was-connected-now-retrying case OnConnectionChanged reports.
+            _logger.LogWarning(startException, "Initial connection attempt to server {ServerId} did not start cleanly; the client will keep retrying on its own", serverId);
+            var detail = startException is null
+                ? "Initial connection attempt did not start cleanly - retrying automatically"
+                : $"Initial connection attempt did not start cleanly ({startException.Message}) - retrying automatically";
+            _ = PublishStatusAsync(RconConnectionStatus.Error, detail, CancellationToken.None);
         }
     }
 
@@ -169,6 +179,13 @@ public sealed class ServerConnectionActor : IAsyncDisposable
     private void OnProcessingError(object? sender, Exception e)
     {
         _logger.LogError(e, "Error processing an inbound frame or connection-state change for server {ServerId} - the frame/transition was dropped, connection unaffected", ServerId);
+
+        // Fire-and-forget, same as the other synchronous event handlers' publishes in this class
+        // (OnRawMessageReceived, HandleConnectionEvent) - this method itself can't be async since it's
+        // wired directly to RustWebRconClient.ProcessingError. Error level, but no PublishStatusAsync -
+        // the connection itself is fine (see this handler's own doc remarks), so this must not touch
+        // the status pipeline that drives the live "connected" badge.
+        _ = PublishDiagnosticAsync(ConnectionLogLevel.Error, $"Error processing an inbound frame: {e.Message}", CancellationToken.None);
     }
 
     private void OnConnectionChanged(object? sender, ConnectionChangedEventArgs e)
@@ -365,6 +382,7 @@ public sealed class ServerConnectionActor : IAsyncDisposable
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "Player-list poll failed for server {ServerId}", ServerId);
+                await PublishDiagnosticAsync(ConnectionLogLevel.Warning, $"Player-list poll failed: {ex.Message}", cancellationToken);
                 continue;
             }
 
@@ -375,6 +393,7 @@ public sealed class ServerConnectionActor : IAsyncDisposable
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "Failed to reconcile player list for server {ServerId}", ServerId);
+                await PublishDiagnosticAsync(ConnectionLogLevel.Warning, $"Failed to reconcile player list: {ex.Message}", cancellationToken);
             }
         }
     }
@@ -469,6 +488,7 @@ public sealed class ServerConnectionActor : IAsyncDisposable
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "serverinfo poll failed for server {ServerId}", ServerId);
+                await PublishDiagnosticAsync(ConnectionLogLevel.Warning, $"serverinfo poll failed: {ex.Message}", cancellationToken);
                 continue;
             }
 
@@ -482,7 +502,7 @@ public sealed class ServerConnectionActor : IAsyncDisposable
                 await _publishEndpoint.Publish(
                     new ServerInfoSnapshotCaptured(
                         ServerId, _tenantId, info.Players, info.MaxPlayers, info.NetworkIn, info.NetworkOut,
-                        info.Memory, DateTimeOffset.UtcNow),
+                        info.Memory, info.Framerate, DateTimeOffset.UtcNow),
                     cancellationToken);
             }
             catch (Exception ex)
@@ -503,6 +523,29 @@ public sealed class ServerConnectionActor : IAsyncDisposable
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Failed to publish connection status for server {ServerId}", ServerId);
+        }
+    }
+
+    /// <summary>
+    /// Appends a Logs-tab entry for something worth surfacing that isn't itself a connection-status
+    /// transition - a parse error, a poll failure, ... - see <see cref="WorkerDiagnosticLogged"/>'s
+    /// remarks. Deliberately only used for failures talking to (or parsing a response from) the actual
+    /// Rust server - a failure publishing *to the message bus itself* (heartbeat, snapshot publish, ...)
+    /// is a different failure domain this method's own publish would likely also be hitting, so those
+    /// stay local-only (<c>_logger.LogWarning</c>) rather than risking a publish call reporting on its
+    /// own kind of failure.
+    /// </summary>
+    private async Task PublishDiagnosticAsync(ConnectionLogLevel level, string message, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await _publishEndpoint.Publish(
+                new WorkerDiagnosticLogged(ServerId, _tenantId, level, message, DateTimeOffset.UtcNow),
+                cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to publish diagnostic log entry for server {ServerId}", ServerId);
         }
     }
 
