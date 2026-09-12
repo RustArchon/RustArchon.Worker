@@ -19,4 +19,10 @@ public interface IInternalApiClient
     /// go through a request/response HTTP round trip.
     /// </remarks>
     Task<InternalRustServerInfo?> GetServerAsync(Guid serverId, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Gets the platform's current email delivery configuration, secrets decrypted. Called fresh on
+    /// every send rather than cached - see <c>InternalController.GetEmailSettings</c>'s remarks.
+    /// </summary>
+    Task<InternalEmailSettings> GetEmailSettingsAsync(CancellationToken cancellationToken);
 }

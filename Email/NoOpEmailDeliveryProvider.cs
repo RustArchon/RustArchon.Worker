@@ -1,26 +1,40 @@
-// Copyright ©2026 Scott Blomfield
-
+using System;
+using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 
 namespace RustArchon.Worker.Email;
 
 /// <summary>
-/// Placeholder <see cref="IEmailDeliveryProvider"/> - logs what would have been sent and "succeeds"
-/// unconditionally, so the queue/retry/dead-letter mechanics around it are real and testable before a
-/// real mail provider is chosen. This is why confirmation/password-reset links only show up in this
-/// process's console output right now rather than an actual inbox - see the README.
+/// A no-operation email delivery provider that does nothing.
+/// This is used as a fallback when no proper email provider is configured.
 /// </summary>
-/// <remarks>
-/// Unlike a real provider, this must never throw - there's nothing to retry here, and the whole point
-/// is to exercise the pipeline's happy path without needing real credentials configured.
-/// </remarks>
-public class NoOpEmailDeliveryProvider(ILogger<NoOpEmailDeliveryProvider> logger) : IEmailDeliveryProvider
+public class NoOpEmailDeliveryProvider : IEmailDeliveryProvider
 {
-    public Task SendAsync(string to, string subject, string htmlBody, CancellationToken cancellationToken)
+    private readonly ILogger<NoOpEmailDeliveryProvider> _logger;
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="NoOpEmailDeliveryProvider"/> class.
+    /// </summary>
+    /// <param name="logger">The logger.</param>
+    public NoOpEmailDeliveryProvider(ILogger<NoOpEmailDeliveryProvider> logger)
     {
-        logger.LogInformation(
-            "Would send email to {To} with subject {Subject}:\n{HtmlBody}",
-            to, subject, htmlBody);
-        return Task.CompletedTask;
+        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
+
+    /// <inheritdoc />
+    public Task<bool> SendEmailAsync(EmailMessage message)
+    {
+        _logger.LogWarning("Email sending called but no email provider configured. Email would be sent to {To}", message?.To ?? "unknown recipient");
+        return Task.FromResult(true);
+    }
+
+    /// <inheritdoc />
+    public Task<bool> VerifyConfigurationAsync()
+    {
+        _logger.LogWarning("Email configuration verification called but no email provider is configured.");
+        return Task.FromResult(false);
+    }
+
+    /// <inheritdoc />
+    public string ProviderName => "None (No Operation)";
 }

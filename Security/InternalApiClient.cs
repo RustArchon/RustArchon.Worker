@@ -31,4 +31,14 @@ public class InternalApiClient(HttpClient httpClient) : IInternalApiClient
 
         return await response.Content.ReadFromJsonAsync<InternalRustServerInfo>(JsonOptions, cancellationToken);
     }
+
+    /// <inheritdoc />
+    public async Task<InternalEmailSettings> GetEmailSettingsAsync(CancellationToken cancellationToken)
+    {
+        using var response = await httpClient.GetAsync("internal/email-settings", cancellationToken);
+        response.EnsureSuccessStatusCode();
+
+        return await response.Content.ReadFromJsonAsync<InternalEmailSettings>(JsonOptions, cancellationToken)
+            ?? throw new InvalidOperationException("internal/email-settings returned an empty body.");
+    }
 }
