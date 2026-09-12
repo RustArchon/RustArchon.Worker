@@ -47,9 +47,11 @@ builder.Services.AddSingleton<IConnectionSupervisor, ConnectionSupervisor>();
 // ============================================
 // 2b. EMAIL DELIVERY
 // ============================================
-// No real provider chosen yet - see NoOpEmailDeliveryProvider's remarks. Swap this registration for a
-// real implementation (SMTP, SendGrid, etc.) before production.
-builder.Services.AddSingleton<IEmailDeliveryProvider, NoOpEmailDeliveryProvider>();
+// No fixed IEmailDeliveryProvider registration - which provider (SMTP, SendGrid, or none at all)
+// applies is decided per-send, from settings fetched fresh off RustArchon.Api, since an admin can
+// change the platform's email settings at any time and this process has no way to be notified of
+// that. See IEmailDeliveryProviderFactory's remarks.
+builder.Services.AddSingleton<IEmailDeliveryProviderFactory, EmailDeliveryProviderFactory>();
 
 // ============================================
 // 3. INTERNAL API CLIENT
@@ -72,6 +74,7 @@ builder.Services.AddMassTransit(x =>
     x.AddConsumer<ServerLifecycleConsumer>();
     x.AddConsumer<SendRconCommandConsumer>();
     x.AddConsumer<EmailRequestedConsumer>();
+    x.AddConsumer<SendTestEmailConsumer>();
 
     x.UsingRabbitMq((context, cfg) =>
     {
@@ -128,6 +131,14 @@ builder.Services.AddMassTransit(x =>
                 TimeSpan.FromMinutes(1),
                 TimeSpan.FromMinutes(5)));
             e.ConfigureConsumer<EmailRequestedConsumer>(context);
+        });
+
+        // Competing consumer, same reasoning as the email queue above - but no retry policy: this is
+        // an interactive admin action with someone waiting on the response, not a queued send that
+        // should keep trying on its own schedule after the caller has already stopped waiting.
+        cfg.ReceiveEndpoint("rustarchon-worker-test-email", e =>
+        {
+            e.ConfigureConsumer<SendTestEmailConsumer>(context);
         });
     });
 });
