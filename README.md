@@ -24,6 +24,10 @@ full architecture and how to run the whole stack locally or via Docker Compose.
 - `Messaging/EmailRequestedConsumer.cs`, `Email/{IEmailDeliveryProvider,NoOpEmailDeliveryProvider}.cs` -
   the queued-email pipeline (see the umbrella README's "Before deploying this anywhere real" -
   `NoOpEmailDeliveryProvider` needs replacing with a real provider before production).
+- `Email/{EmailDeliveryOptions,SuppressedEmailDeliveryProvider}.cs` - the
+  `RUSTARCHON_SUPPRESS_EMAIL_DELIVERY` kill switch: a test/staging deployment can keep a real provider
+  configured on the platform's Email settings page while guaranteeing this process never actually
+  sends anything.
 - `Security/InternalApiClient.cs` - calls RustArchon.Api's internal endpoints (credential handoff,
   server info) using the shared internal API key, not a user JWT.
 

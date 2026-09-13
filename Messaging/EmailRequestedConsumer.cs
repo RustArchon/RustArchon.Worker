@@ -61,11 +61,16 @@ public class EmailRequestedConsumer(
 
         var success = await provider.SendEmailAsync(emailMessage);
 
+        // Told apart from an ordinary send so RustArchon.Api can record it as Suppressed rather than
+        // Sent - see CommunicationDelivered.Suppressed's remarks.
+        var suppressed = provider is SuppressedEmailDeliveryProvider;
+
         await publishEndpoint.Publish(
             new CommunicationDelivered(
                 message.MessageId,
                 success,
-                success ? null : $"The {provider.ProviderName} provider reported failure - see this worker's logs."),
+                success ? null : $"The {provider.ProviderName} provider reported failure - see this worker's logs.",
+                suppressed),
             context.CancellationToken);
     }
 }
