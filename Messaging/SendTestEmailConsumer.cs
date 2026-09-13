@@ -32,10 +32,11 @@ public class SendTestEmailConsumer(
         var settings = await internalApiClient.GetEmailSettingsAsync(context.CancellationToken);
         var provider = providerFactory.Resolve(settings);
 
-        // Unlike a real EmailRequested send, where NoOpEmailDeliveryProvider reporting success is the
-        // right way to avoid pointless retries of a deliberately-unconfigured setup, a *test* send
-        // saying "delivered" via a provider that sends nothing would be actively misleading - the
-        // entire point of this button is telling the admin whether real delivery works.
+        // Unlike a real EmailRequested send, where NoOpEmailDeliveryProvider/SuppressedEmailDeliveryProvider
+        // reporting success is the right way to avoid pointless retries of a send that was never going
+        // to happen, a *test* send saying "delivered" via a provider that sends nothing would be
+        // actively misleading - the entire point of this button is telling the admin whether real
+        // delivery works.
         if (provider is NoOpEmailDeliveryProvider)
         {
             await context.RespondAsync(new SendTestEmailResult(
@@ -43,6 +44,17 @@ public class SendTestEmailConsumer(
                 $"No usable configuration for the selected provider ({settings.ServiceProvider}) - " +
                     "check the Email settings.",
                 "None"));
+            return;
+        }
+
+        if (provider is SuppressedEmailDeliveryProvider)
+        {
+            await context.RespondAsync(new SendTestEmailResult(
+                false,
+                "This worker has RUSTARCHON_SUPPRESS_EMAIL_DELIVERY set - real delivery is disabled " +
+                    "for this deployment, so a test send can't confirm anything. Unset it on this " +
+                    "instance to test real delivery.",
+                provider.ProviderName));
             return;
         }
 

@@ -51,6 +51,14 @@ builder.Services.AddSingleton<IConnectionSupervisor, ConnectionSupervisor>();
 // applies is decided per-send, from settings fetched fresh off RustArchon.Api, since an admin can
 // change the platform's email settings at any time and this process has no way to be notified of
 // that. See IEmailDeliveryProviderFactory's remarks.
+//
+// RUSTARCHON_SUPPRESS_EMAIL_DELIVERY is a separate, deployment-level override read once here at
+// startup (unset/false unless a deployment's .env sets it) - lets a test/staging instance keep a real
+// provider configured in the platform settings (to exercise that UI end to end) while guaranteeing
+// nothing this process sends ever actually leaves it. See EmailDeliveryOptions's remarks for why this
+// exists.
+var suppressEmailDelivery = builder.Configuration.GetValue<bool>("RUSTARCHON_SUPPRESS_EMAIL_DELIVERY");
+builder.Services.AddSingleton(new EmailDeliveryOptions(suppressEmailDelivery));
 builder.Services.AddSingleton<IEmailDeliveryProviderFactory, EmailDeliveryProviderFactory>();
 
 // ============================================

@@ -35,11 +35,21 @@ public class EmailDeliveryProviderFactory(
     ILogger<SendGridEmailDeliveryProvider> sendGridLogger,
     ILogger<ResendEmailDeliveryProvider> resendLogger,
     ILogger<NoOpEmailDeliveryProvider> noOpLogger,
-    IHttpClientFactory httpClientFactory) : IEmailDeliveryProviderFactory
+    ILogger<SuppressedEmailDeliveryProvider> suppressedLogger,
+    IHttpClientFactory httpClientFactory,
+    EmailDeliveryOptions deliveryOptions) : IEmailDeliveryProviderFactory
 {
     /// <inheritdoc />
     public IEmailDeliveryProvider Resolve(InternalEmailSettings settings)
     {
+        // Checked first and unconditionally - a deployment-level kill switch overrides whatever the
+        // platform's own (admin-editable) settings say, not just another provider choice among them.
+        // See EmailDeliveryOptions's remarks.
+        if (deliveryOptions.SuppressDelivery)
+        {
+            return new SuppressedEmailDeliveryProvider(suppressedLogger);
+        }
+
         if (settings.ServiceProvider == EmailProviders.Resend && !string.IsNullOrEmpty(settings.ApiKey))
         {
             return new ResendEmailDeliveryProvider(resendLogger, httpClientFactory.CreateClient(), settings.ApiKey);
