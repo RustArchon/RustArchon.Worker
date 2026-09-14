@@ -2,6 +2,7 @@
 
 using MassTransit;
 using RustArchon.Messaging.Contracts;
+using RustArchon.Rcon;
 using RustArchon.Worker.Connections;
 
 namespace RustArchon.Worker.Messaging;
@@ -23,7 +24,9 @@ public class SendRconCommandConsumer(IConnectionSupervisor supervisor) : IConsum
             return;
         }
 
-        var result = await actor.SendCommandAsync(context.Message.Command, timeout: null, context.CancellationToken);
+        var result = await actor.SendCommandAsync(
+            context.Message.Command, timeout: null, context.CancellationToken,
+            new RconCommandContext(context.Message.Interactive));
         await context.RespondAsync(result);
     }
 }
