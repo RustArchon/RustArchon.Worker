@@ -22,9 +22,18 @@ public class NoOpEmailDeliveryProvider : IEmailDeliveryProvider
     }
 
     /// <inheritdoc />
+    /// <remarks>
+    /// The full body is logged deliberately, not just the recipient - this is the only way to reach a
+    /// confirmation/reset link on a deployment that hasn't configured a real provider yet (see
+    /// DEPLOYMENT.md's "First login" step, which greps this exact log line). A wording change here
+    /// broke that grep once already - keep the "Would send email" phrase and the body together if this
+    /// is ever touched again.
+    /// </remarks>
     public Task<bool> SendEmailAsync(EmailMessage message)
     {
-        _logger.LogWarning("Email sending called but no email provider configured. Email would be sent to {To}", message?.To ?? "unknown recipient");
+        _logger.LogWarning(
+            "No email provider configured. Would send email to {To} with subject {Subject}:\n{Body}",
+            message?.To ?? "unknown recipient", message?.Subject ?? string.Empty, message?.Body ?? string.Empty);
         return Task.FromResult(true);
     }
 
