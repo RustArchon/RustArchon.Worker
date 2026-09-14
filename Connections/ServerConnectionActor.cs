@@ -115,7 +115,8 @@ public sealed class ServerConnectionActor : IAsyncDisposable
             port,
             rconPassword,
             reconnectTimeout: reconnectOptions.ReconnectTimeout,
-            errorReconnectTimeout: reconnectOptions.ErrorReconnectTimeout);
+            errorReconnectTimeout: reconnectOptions.ErrorReconnectTimeout,
+            maxErrorReconnectTimeout: reconnectOptions.MaxErrorReconnectTimeout);
         _client.ConnectionChanged += OnConnectionChanged;
         _client.MessageReceived += OnRawMessageReceived;
         _client.ProcessingError += OnProcessingError;
