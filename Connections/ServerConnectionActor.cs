@@ -148,15 +148,32 @@ public sealed class ServerConnectionActor : IAsyncDisposable
     /// <summary>
     /// Sends a command over the live connection and awaits its response.
     /// </summary>
+    /// <param name="context">
+    /// No default - every caller has to say whether this is a human-triggered command or a backend
+    /// fetch reusing this same pathway, so it's a compile error to add a new caller without answering
+    /// that. See <see cref="RconCommandContext"/>'s remarks and <see cref="OnRawMessageReceived"/>.
+    /// </param>
     /// <returns>
     /// A result with <c>Error = "NotConnected"</c> if the socket isn't open right now, or
     /// <c>Error = "Timeout"</c> if no response arrives within <paramref name="timeout"/>.
     /// </returns>
-    public async Task<RconCommandResult> SendCommandAsync(string command, TimeSpan? timeout, CancellationToken cancellationToken)
+    public async Task<RconCommandResult> SendCommandAsync(
+        string command, TimeSpan? timeout, CancellationToken cancellationToken, RconCommandContext context)
     {
+        // Captured here, not inside RustWebRconClient - this is the one place that knows both the
+        // actual command text and whether it's interactive before anything is sent. There's no
+        // response-correlated Identifier yet at this point (RustWebRconClient generates that internally
+        // and doesn't hand it back synchronously), so a Sent frame publishes Identifier: 0 rather than
+        // trying to thread it through; the Received frame that (usually) follows still carries its own
+        // real Identifier. Fire-and-forget, same as every other publish in this class - a lost Sent
+        // frame here isn't worth failing the command over.
+        _ = _publishEndpoint.Publish(new RconFrameCaptured(
+            ServerId, _tenantId, DateTimeOffset.UtcNow, Identifier: 0, Type: string.Empty, command,
+            Stacktrace: null, context.Interactive, RconEventDirection.Sent));
+
         try
         {
-            var response = await _client.SendCommandAsync(command, timeout ?? DefaultCommandTimeout, cancellationToken);
+            var response = await _client.SendCommandAsync(command, timeout ?? DefaultCommandTimeout, cancellationToken, context);
             return new RconCommandResult(true, response.Message, response.Type, response.Stacktrace, null);
         }
         catch (InvalidOperationException)
@@ -214,6 +231,14 @@ public sealed class ServerConnectionActor : IAsyncDisposable
     private void OnRawMessageReceived(object? sender, MessageReceivedEventArgs e)
     {
         var response = e.Response;
+
+        // Every response is captured and persisted, unconditionally - see RconFrameCaptured's remarks
+        // for why this used to suppress non-interactive responses here and no longer does. What used to
+        // be a publish/don't-publish decision at this layer is now just a data field: an unsolicited
+        // frame (no RconCommandContext attached - e.UserData is null, e.g. an unprompted console line)
+        // is always interactive, since RustArchon never triggers those itself; a command's response
+        // carries through whatever RconCommandContext.Interactive its sender attached.
+        var interactive = e.UserData is not RconCommandContext { Interactive: false };
         _ = _publishEndpoint.Publish(new RconFrameCaptured(
             ServerId,
             _tenantId,
@@ -221,7 +246,9 @@ public sealed class ServerConnectionActor : IAsyncDisposable
             response.Identifier,
             response.Type,
             response.Message,
-            response.Stacktrace));
+            response.Stacktrace,
+            interactive,
+            RconEventDirection.Received));
 
         // Every frame is a candidate death line - see KillFeedTextParser's remarks for why this can't
         // be narrowed to "only generic console frames" up front (the Type field's meaning isn't
@@ -363,13 +390,18 @@ public sealed class ServerConnectionActor : IAsyncDisposable
             List<Player> currentPlayers;
             try
             {
-                // raiseMessageReceived: false - this is RustArchon's own internal reconciliation
-                // check, not something the user ran, so its response shouldn't join the server's
-                // actual console/chat history (see RustWebRconClient.SendCommandAsync's remarks). A
-                // user-run "playerlist" from the Console tab goes through SendCommandAsync below with
-                // the default (true) and does show up, same as any other command they send.
+                // RconCommandContext.Background - this is RustArchon's own internal reconciliation
+                // check, not something the user ran, so its response is persisted but hidden from an
+                // ordinary user's Console tab (see RconCommandContext's remarks). A user-run
+                // "playerlist" from the Console tab goes through the public SendCommandAsync wrapper
+                // above with an Interactive: true context and does show up, same as any other command
+                // they send. Called directly against _client, not through this class's own
+                // SendCommandAsync wrapper above, so this loop's "Sent" side is deliberately never
+                // published - a fixed command on a fixed schedule doesn't need its own Sent/Received
+                // pairing in the console history the way an operator-typed command does; only the
+                // response (already interesting for reconciliation) is captured.
                 var response = await _client.SendCommandAsync(
-                    "playerlist", DefaultCommandTimeout, cancellationToken, raiseMessageReceived: false);
+                    "playerlist", DefaultCommandTimeout, cancellationToken, RconCommandContext.Background);
                 currentPlayers = JsonSerializer.Deserialize<List<Player>>(response.Message, PlayerListJsonOptions) ?? new List<Player>();
             }
             catch (InvalidOperationException)
@@ -471,11 +503,12 @@ public sealed class ServerConnectionActor : IAsyncDisposable
             ServerInfoPollResult? info;
             try
             {
-                // raiseMessageReceived: false - same reasoning as the playerlist poll above: this is
-                // RustArchon's own internal telemetry capture, not something a user ran, so it
-                // shouldn't join the server's actual console history.
+                // RconCommandContext.Background - same reasoning as the playerlist poll above: this is
+                // RustArchon's own internal telemetry capture, not something a user ran, so its
+                // response is persisted but hidden from an ordinary user's console history, and its
+                // Sent side is deliberately never published either.
                 var response = await _client.SendCommandAsync(
-                    "serverinfo", DefaultCommandTimeout, cancellationToken, raiseMessageReceived: false);
+                    "serverinfo", DefaultCommandTimeout, cancellationToken, RconCommandContext.Background);
                 info = JsonSerializer.Deserialize<ServerInfoPollResult>(response.Message);
             }
             catch (InvalidOperationException)
