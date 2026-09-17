@@ -1,0 +1,28 @@
+# Configures GitHub's own "Generate release notes" feature (used both from the UI when drafting a
+# release, and via `gh api repos/<owner>/<repo>/releases/generate-notes`) - groups merged PRs since the
+# last tag by label into these sections. No separate tooling, no commit-message convention required;
+# just label PRs consistently. See the umbrella repo's RELEASE_CHECKLIST.md for how this fits into an
+# actual release.
+changelog:
+  exclude:
+    labels:
+      - ignore-for-release
+  categories:
+    - title: Breaking Changes
+      labels:
+        - breaking
+    - title: New Features
+      labels:
+        - feature
+    - title: Fixes
+      labels:
+        - fix
+    - title: Maintenance
+      labels:
+        - chore
+    - title: Documentation
+      labels:
+        - docs
+    - title: Other Changes
+      labels:
+        - "*"
