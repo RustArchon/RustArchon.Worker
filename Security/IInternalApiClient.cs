@@ -25,4 +25,11 @@ public interface IInternalApiClient
     /// every send rather than cached - see <c>InternalController.GetEmailSettings</c>'s remarks.
     /// </summary>
     Task<InternalEmailSettings> GetEmailSettingsAsync(CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Gets the platform's current ticketing-integration configuration, secret decrypted. Called fresh
+    /// on every ticket event rather than cached - see <c>InternalController.GetTicketingSettings</c>'s
+    /// remarks.
+    /// </summary>
+    Task<InternalTicketingSettings> GetTicketingSettingsAsync(CancellationToken cancellationToken);
 }

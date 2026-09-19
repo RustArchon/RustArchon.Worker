@@ -10,6 +10,7 @@ using RustArchon.Worker.Connections;
 using RustArchon.Worker.Email;
 using RustArchon.Worker.Messaging;
 using RustArchon.Worker.Security;
+using RustArchon.Worker.Ticketing;
 
 var builder = Host.CreateApplicationBuilder(args);
 
@@ -62,6 +63,13 @@ builder.Services.AddSingleton(new EmailDeliveryOptions(suppressEmailDelivery));
 builder.Services.AddSingleton<IEmailDeliveryProviderFactory, EmailDeliveryProviderFactory>();
 
 // ============================================
+// 2c. TICKETING INTEGRATION
+// ============================================
+// Same reasoning as email delivery just above - which provider (Internal/Webhook) applies is decided
+// per-event, from settings fetched fresh off RustArchon.Api, since an admin can flip this at any time.
+builder.Services.AddSingleton<ITicketingIntegrationProviderFactory, TicketingIntegrationProviderFactory>();
+
+// ============================================
 // 3. INTERNAL API CLIENT
 // ============================================
 // Never a user JWT - a completely separate, non-tenant-scoped shared secret. This is the only place
@@ -83,6 +91,7 @@ builder.Services.AddMassTransit(x =>
     x.AddConsumer<SendRconCommandConsumer>();
     x.AddConsumer<EmailRequestedConsumer>();
     x.AddConsumer<SendTestEmailConsumer>();
+    x.AddConsumer<TicketEventConsumer>();
 
     x.UsingRabbitMq((context, cfg) =>
     {
@@ -147,6 +156,21 @@ builder.Services.AddMassTransit(x =>
         cfg.ReceiveEndpoint("rustarchon-worker-test-email", e =>
         {
             e.ConfigureConsumer<SendTestEmailConsumer>(context);
+        });
+
+        // Competing consumer, durable queue, same retry policy as the email queue above - a webhook
+        // delivery to an external system is exactly the same "should keep trying with backoff, never
+        // silently drop it" concern as sending an email.
+        cfg.ReceiveEndpoint("rustarchon-worker-ticket-events", e =>
+        {
+            e.Durable = true;
+            e.UseMessageRetry(r => r.Intervals(
+                TimeSpan.FromSeconds(5),
+                TimeSpan.FromSeconds(15),
+                TimeSpan.FromSeconds(30),
+                TimeSpan.FromMinutes(1),
+                TimeSpan.FromMinutes(5)));
+            e.ConfigureConsumer<TicketEventConsumer>(context);
         });
     });
 });
