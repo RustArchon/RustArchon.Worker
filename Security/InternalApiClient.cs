@@ -41,4 +41,14 @@ public class InternalApiClient(HttpClient httpClient) : IInternalApiClient
         return await response.Content.ReadFromJsonAsync<InternalEmailSettings>(JsonOptions, cancellationToken)
             ?? throw new InvalidOperationException("internal/email-settings returned an empty body.");
     }
+
+    /// <inheritdoc />
+    public async Task<InternalTicketingSettings> GetTicketingSettingsAsync(CancellationToken cancellationToken)
+    {
+        using var response = await httpClient.GetAsync("internal/ticketing-settings", cancellationToken);
+        response.EnsureSuccessStatusCode();
+
+        return await response.Content.ReadFromJsonAsync<InternalTicketingSettings>(JsonOptions, cancellationToken)
+            ?? throw new InvalidOperationException("internal/ticketing-settings returned an empty body.");
+    }
 }
