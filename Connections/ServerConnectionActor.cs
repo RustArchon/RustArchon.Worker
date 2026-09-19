@@ -55,6 +55,15 @@ public sealed class ServerConnectionActor : IAsyncDisposable
     // that a busy tenant's snapshot table doesn't grow unreasonably fast (1,440 rows/server/day).
     private static readonly TimeSpan ServerInfoPollInterval = TimeSpan.FromSeconds(60);
 
+    // Keeps the Plugins tab's ServerPlugin rows current - see ServerPluginsCaptured's remarks. The
+    // plugin set only changes when an admin loads/unloads/updates one, so unlike the two polls above a
+    // several-minute interval is plenty; the short first delay just gives a freshly-claimed server time
+    // to finish connecting so the tab isn't empty for a whole interval, and a failed attempt (not
+    // connected yet, no reply in time) retries on the short one rather than waiting out a full interval.
+    private static readonly TimeSpan PluginListPollInterval = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan PluginListInitialDelay = TimeSpan.FromSeconds(20);
+    private static readonly TimeSpan PluginListRetryInterval = TimeSpan.FromSeconds(30);
+
     // Only the fields ServerInfoSnapshotCaptured actually carries - deliberately not the full
     // RustArchon.Rcon.Entities.ServerInfo shape. That type's GameTime/SaveCreatedTime use a
     // non-ISO date format requiring ServerInfoParser's custom DateTimeConverter (see ParserBase) to
@@ -80,6 +89,7 @@ public sealed class ServerConnectionActor : IAsyncDisposable
     private readonly Task _heartbeatLoopTask;
     private readonly Task _playerListPollLoopTask;
     private readonly Task _serverInfoPollLoopTask;
+    private readonly Task _pluginListPollLoopTask;
 
     // Actor-local, not persisted - rebuilt from scratch every time this actor starts (a fresh worker
     // claim, or this same worker reconnecting after a restart). See PlayerListPollLoopAsync's remarks
@@ -124,6 +134,7 @@ public sealed class ServerConnectionActor : IAsyncDisposable
         _heartbeatLoopTask = Task.Run(() => HeartbeatLoopAsync(_lifetimeCts.Token));
         _playerListPollLoopTask = Task.Run(() => PlayerListPollLoopAsync(_lifetimeCts.Token));
         _serverInfoPollLoopTask = Task.Run(() => ServerInfoPollLoopAsync(_lifetimeCts.Token));
+        _pluginListPollLoopTask = Task.Run(() => PluginListPollLoopAsync(_lifetimeCts.Token));
 
         _ = PublishStatusAsync(RconConnectionStatus.Connecting, $"Connecting to {host}:{port}", CancellationToken.None);
         if (!_client.Connect(out var startException))
@@ -546,6 +557,99 @@ public sealed class ServerConnectionActor : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Polls the server's plugin list on a fixed interval and publishes <see cref="ServerPluginsCaptured"/>
+    /// with the complete current list - see that record's remarks.
+    /// </summary>
+    private async Task PluginListPollLoopAsync(CancellationToken cancellationToken)
+    {
+        var delay = PluginListInitialDelay;
+
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                await Task.Delay(delay, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+
+            // Pessimistic until this attempt actually gets an answer from the server.
+            delay = PluginListRetryInterval;
+
+            ServerModFramework framework;
+            IReadOnlyList<ServerPluginInfo> plugins;
+            try
+            {
+                (framework, plugins) = await QueryPluginListAsync(cancellationToken);
+            }
+            catch (InvalidOperationException)
+            {
+                continue; // Not connected right now - retried on the short interval.
+            }
+            catch (TimeoutException)
+            {
+                continue; // No response in time - treated the same as "not connected right now".
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Plugin-list poll failed for server {ServerId}", ServerId);
+                await PublishDiagnosticAsync(ConnectionLogLevel.Warning, $"Plugin-list poll failed: {ex.Message}", cancellationToken);
+                continue;
+            }
+
+            delay = PluginListPollInterval;
+
+            try
+            {
+                await _publishEndpoint.Publish(
+                    new ServerPluginsCaptured(ServerId, _tenantId, framework, plugins, DateTimeOffset.UtcNow),
+                    cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to publish plugin list for server {ServerId}", ServerId);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Asks Carbon first (<c>c.plugins</c>), then Oxide (<c>o.plugins</c>) only if that produced no
+    /// plugins - Carbon ships an Oxide compatibility layer, so a Carbon server may well also answer
+    /// <c>o.plugins</c>, whereas an Oxide server never answers <c>c.plugins</c>. Probing both every time
+    /// (rather than trusting <see cref="RustWebRconClient.DetectedModFramework"/>) means a framework
+    /// installed or removed after this actor started is noticed without a worker restart. Neither
+    /// producing a plugin means <see cref="ServerModFramework.None"/> - which is also what a framework
+    /// with zero plugins loaded looks like, and reads the same to a user: nothing to list.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">Not connected.</exception>
+    /// <exception cref="TimeoutException">No response within <see cref="DefaultCommandTimeout"/>.</exception>
+    private async Task<(ServerModFramework Framework, IReadOnlyList<ServerPluginInfo> Plugins)> QueryPluginListAsync(
+        CancellationToken cancellationToken)
+    {
+        // RconCommandContext.Background - same reasoning as the playerlist/serverinfo polls above.
+        var carbon = await _client.SendCommandAsync(
+            "c.plugins", DefaultCommandTimeout, cancellationToken, RconCommandContext.Background);
+        var carbonPlugins = ServerPluginListParser.Parse(ServerModFramework.Carbon, carbon.Message);
+        if (carbonPlugins.Count > 0)
+        {
+            return (ServerModFramework.Carbon, carbonPlugins);
+        }
+
+        var oxide = await _client.SendCommandAsync(
+            "o.plugins", DefaultCommandTimeout, cancellationToken, RconCommandContext.Background);
+        var oxidePlugins = ServerPluginListParser.Parse(ServerModFramework.Oxide, oxide.Message);
+        return oxidePlugins.Count > 0
+            ? (ServerModFramework.Oxide, oxidePlugins)
+            : (ServerModFramework.None, []);
+    }
+
     private async Task PublishStatusAsync(RconConnectionStatus status, string? detail, CancellationToken cancellationToken)
     {
         try
@@ -608,6 +712,15 @@ public sealed class ServerConnectionActor : IAsyncDisposable
         try
         {
             await _serverInfoPollLoopTask;
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected on shutdown.
+        }
+
+        try
+        {
+            await _pluginListPollLoopTask;
         }
         catch (OperationCanceledException)
         {
