@@ -313,6 +313,14 @@ public sealed class ServerConnectionActor : IAsyncDisposable
         _ = PublishStatusAsync(status, detail, CancellationToken.None);
     }
 
+    private readonly BackgroundFrameSampler _frameSampler = new();
+
+    /// <summary>
+    /// What a command the Worker sends for its own bookkeeping carries: "nobody typed this" (the same fact as
+    /// <see cref="RconCommandContext.Background"/>) plus which poll it is and how much of its answers the console record keeps.
+    /// </summary>
+    private static BackgroundPoll Poll(string key, PollStorage storage) => new(key, storage);
+
     private void OnRawMessageReceived(object? sender, MessageReceivedEventArgs e)
     {
         var response = e.Response;
@@ -323,12 +331,17 @@ public sealed class ServerConnectionActor : IAsyncDisposable
         // frame (no RconCommandContext attached - e.UserData is null, e.g. an unprompted console line)
         // is always interactive, since RustArchon never triggers those itself; a command's response
         // carries through whatever RconCommandContext.Interactive its sender attached.
-        var interactive = e.UserData is not RconCommandContext { Interactive: false };
+        var poll = e.UserData as BackgroundPoll;
+        var interactive = poll is null && e.UserData is not RconCommandContext { Interactive: false };
 
-        // The one thing not stored: a background drain poll's "nothing new since last time". On a quiet server that is nearly
-        // every answer (thousands a day per server), and it carries no information the next real answer does not. Anything
-        // else - data, an error, a "lost" or "reset" flag, or a person's own command - is stored as before.
-        if (interactive || !EmptyPollReply.IsEmpty(response.Message))
+        // What is not stored: a background poll's "nothing new since last time". On a quiet server that is nearly every answer
+        // (thousands a day per server), and it carries no information the next real answer does not. And of the answers that
+        // do carry data, only a sample or a change: the data itself is stored in its own table, and the console record's copy
+        // is there to show the poll happens (see BackgroundFrameSampler). Anything a person typed, and anything that reports a
+        // failure, is stored as before.
+        if (interactive
+            || (!EmptyPollReply.IsEmpty(response.Message)
+                && (poll is null || _frameSampler.ShouldStore(poll, response.Message, response.Stacktrace, DateTimeOffset.UtcNow))))
         {
             _ = _publishEndpoint.Publish(new RconFrameCaptured(
                 ServerId,
@@ -493,7 +506,7 @@ public sealed class ServerConnectionActor : IAsyncDisposable
                 // pairing in the console history the way an operator-typed command does; only the
                 // response (already interesting for reconciliation) is captured.
                 var response = await _client.SendCommandAsync(
-                    "playerlist", DefaultCommandTimeout, cancellationToken, RconCommandContext.Background);
+                    "playerlist", DefaultCommandTimeout, cancellationToken, Poll("playerlist", PollStorage.Sampled));
                 currentPlayers = JsonSerializer.Deserialize<List<Player>>(response.Message, PlayerListJsonOptions) ?? new List<Player>();
             }
             catch (InvalidOperationException)
@@ -600,7 +613,7 @@ public sealed class ServerConnectionActor : IAsyncDisposable
                 // response is persisted but hidden from an ordinary user's console history, and its
                 // Sent side is deliberately never published either.
                 var response = await _client.SendCommandAsync(
-                    "serverinfo", DefaultCommandTimeout, cancellationToken, RconCommandContext.Background);
+                    "serverinfo", DefaultCommandTimeout, cancellationToken, Poll("serverinfo", PollStorage.Sampled));
                 info = JsonSerializer.Deserialize<ServerInfoPollResult>(response.Message);
             }
             catch (InvalidOperationException)
@@ -662,9 +675,10 @@ public sealed class ServerConnectionActor : IAsyncDisposable
 
             ServerModFramework framework;
             IReadOnlyList<ServerPluginInfo> plugins;
+            IReadOnlyList<ServerPluginFailure>? failures;
             try
             {
-                (framework, plugins) = await QueryPluginListAsync(cancellationToken);
+                (framework, plugins, failures) = await QueryPluginListAsync(cancellationToken);
             }
             catch (InvalidOperationException)
             {
@@ -690,7 +704,7 @@ public sealed class ServerConnectionActor : IAsyncDisposable
             try
             {
                 await _publishEndpoint.Publish(
-                    new ServerPluginsCaptured(ServerId, _tenantId, framework, plugins, DateTimeOffset.UtcNow),
+                    new ServerPluginsCaptured(ServerId, _tenantId, framework, plugins, DateTimeOffset.UtcNow, failures),
                     cancellationToken);
             }
             catch (Exception ex)
@@ -713,24 +727,27 @@ public sealed class ServerConnectionActor : IAsyncDisposable
     /// </summary>
     /// <exception cref="InvalidOperationException">Not connected.</exception>
     /// <exception cref="TimeoutException">No response within <see cref="DefaultCommandTimeout"/>.</exception>
-    private async Task<(ServerModFramework Framework, IReadOnlyList<ServerPluginInfo> Plugins)> QueryPluginListAsync(
+    private async Task<(ServerModFramework Framework, IReadOnlyList<ServerPluginInfo> Plugins, IReadOnlyList<ServerPluginFailure>? Failures)> QueryPluginListAsync(
         CancellationToken cancellationToken)
     {
         // RconCommandContext.Background - same reasoning as the playerlist/serverinfo polls above.
         var carbon = await _client.SendCommandAsync(
-            "c.plugins", DefaultCommandTimeout, cancellationToken, RconCommandContext.Background);
+            "c.plugins", DefaultCommandTimeout, cancellationToken, Poll("c.plugins", PollStorage.OnChange));
         var carbonPlugins = ServerPluginListParser.Parse(ServerModFramework.Carbon, carbon.Message);
-        if (carbonPlugins.Count > 0)
+        var carbonFailures = CarbonFailedPluginParser.TryParse(carbon.Message, out var failed) ? failed : null;
+
+        // A Carbon server whose every plugin failed to compile has nothing loaded but is plainly Carbon, and is the case that most needs the reasons.
+        if (carbonPlugins.Count > 0 || carbonFailures is { Count: > 0 })
         {
-            return (ServerModFramework.Carbon, carbonPlugins);
+            return (ServerModFramework.Carbon, carbonPlugins, carbonFailures);
         }
 
         var oxide = await _client.SendCommandAsync(
-            "o.plugins", DefaultCommandTimeout, cancellationToken, RconCommandContext.Background);
+            "o.plugins", DefaultCommandTimeout, cancellationToken, Poll("o.plugins", PollStorage.OnChange));
         var oxidePlugins = ServerPluginListParser.Parse(ServerModFramework.Oxide, oxide.Message);
         return oxidePlugins.Count > 0
-            ? (ServerModFramework.Oxide, oxidePlugins)
-            : (ServerModFramework.None, []);
+            ? (ServerModFramework.Oxide, oxidePlugins, null)
+            : (ServerModFramework.None, [], null);
     }
 
     /// <summary>
@@ -760,7 +777,7 @@ public sealed class ServerConnectionActor : IAsyncDisposable
             // Background: this is our own bookkeeping poll, not something a person typed - same reasoning as
             // the plugin-list/playerlist/serverinfo polls.
             var reply = await _client.SendCommandAsync(
-                "archon.hello", DefaultCommandTimeout, cancellationToken, RconCommandContext.Background);
+                "archon.hello", DefaultCommandTimeout, cancellationToken, Poll("archon.hello", PollStorage.OnChange));
 
             if (!ArchonHelloParser.TryParse(reply.Message, out var hello, out var failure) || hello is null)
             {
@@ -883,7 +900,7 @@ public sealed class ServerConnectionActor : IAsyncDisposable
         try
         {
             var reply = await _client.SendCommandAsync(
-                "archon.updates", DefaultCommandTimeout, cancellationToken, RconCommandContext.Background);
+                "archon.updates", DefaultCommandTimeout, cancellationToken, Poll("archon.updates", PollStorage.OnChange));
 
             if (!ArchonUpdatesParser.TryParse(reply.Message, out var updates, out var failure) || updates is null)
             {
@@ -955,7 +972,7 @@ public sealed class ServerConnectionActor : IAsyncDisposable
         try
         {
             var reply = await _client.SendCommandAsync(
-                "archon.map.status", DefaultCommandTimeout, cancellationToken, RconCommandContext.Background);
+                "archon.map.status", DefaultCommandTimeout, cancellationToken, Poll("archon.map.status", PollStorage.OnChange));
 
             if (!ArchonMapParser.TryParseStatus(reply.Message, out var status, out var failure) || status is null)
             {
@@ -1015,7 +1032,7 @@ public sealed class ServerConnectionActor : IAsyncDisposable
     private async Task<string?> ReadMonumentsAsync(CancellationToken cancellationToken)
     {
         var reply = await _client.SendCommandAsync(
-            "archon.map.monuments", DefaultCommandTimeout, cancellationToken, RconCommandContext.Background);
+            "archon.map.monuments", DefaultCommandTimeout, cancellationToken, Poll("archon.map.monuments", PollStorage.OnChange));
 
         if (ArchonMapParser.TryParseMonuments(reply.Message, out var monuments, out var failure))
         {
@@ -1081,7 +1098,7 @@ public sealed class ServerConnectionActor : IAsyncDisposable
             for (var pageNumber = 0; pageNumber < TcMaxPagesPerRead; pageNumber++)
             {
                 var reply = await _client.SendCommandAsync(
-                    $"archon.tcs {offset} {TcPageSize}", DefaultCommandTimeout, cancellationToken, RconCommandContext.Background);
+                    $"archon.tcs {offset} {TcPageSize}", DefaultCommandTimeout, cancellationToken, Poll($"archon.tcs {offset}", PollStorage.OnChange));
 
                 if (!ArchonTcsParser.TryParse(reply.Message, out var page, out var failure) || page is null)
                 {
@@ -1139,7 +1156,7 @@ public sealed class ServerConnectionActor : IAsyncDisposable
             {
                 var reply = await _client.SendCommandAsync(
                     $"archon.events.drain {_combatBootId} {_combatCursor} {CombatDrainBatchSize}",
-                    DefaultCommandTimeout, cancellationToken, RconCommandContext.Background);
+                    DefaultCommandTimeout, cancellationToken, Poll("archon.events.drain", PollStorage.Sampled));
 
                 if (!ArchonEventsParser.TryParse(reply.Message, out var drain, out var failure) || drain is null)
                 {
@@ -1205,7 +1222,7 @@ public sealed class ServerConnectionActor : IAsyncDisposable
             {
                 var reply = await _client.SendCommandAsync(
                     $"archon.positions.drain {_positionsBootId} {_positionsCursor} {PositionsDrainBatchSize}",
-                    DefaultCommandTimeout, cancellationToken, RconCommandContext.Background);
+                    DefaultCommandTimeout, cancellationToken, Poll("archon.positions.drain", PollStorage.Sampled));
 
                 if (!ArchonPositionsParser.TryParse(reply.Message, out var drain, out var failure) || drain is null)
                 {
@@ -1265,7 +1282,7 @@ public sealed class ServerConnectionActor : IAsyncDisposable
         try
         {
             var reply = await _client.SendCommandAsync(
-                "archon.stats", DefaultCommandTimeout, cancellationToken, RconCommandContext.Background);
+                "archon.stats", DefaultCommandTimeout, cancellationToken, Poll("archon.stats", PollStorage.Sampled));
             _logger.LogInformation("Server {ServerId}: RustArchon plugin stats {Stats}", ServerId, reply.Message);
         }
         catch (Exception)
