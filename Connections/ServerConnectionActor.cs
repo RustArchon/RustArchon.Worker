@@ -315,7 +315,7 @@ public sealed class ServerConnectionActor : IAsyncDisposable
         // The one thing not stored: a background drain poll's "nothing new since last time". On a quiet server that is nearly
         // every answer (thousands a day per server), and it carries no information the next real answer does not. Anything
         // else - data, an error, a "lost" or "reset" flag, or a person's own command - is stored as before.
-        if (interactive || !EmptyDrainReply.IsEmpty(response.Message))
+        if (interactive || !EmptyPollReply.IsEmpty(response.Message))
         {
             _ = _publishEndpoint.Publish(new RconFrameCaptured(
                 ServerId,
