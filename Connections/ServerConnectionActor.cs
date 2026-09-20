@@ -311,16 +311,23 @@ public sealed class ServerConnectionActor : IAsyncDisposable
         // is always interactive, since RustArchon never triggers those itself; a command's response
         // carries through whatever RconCommandContext.Interactive its sender attached.
         var interactive = e.UserData is not RconCommandContext { Interactive: false };
-        _ = _publishEndpoint.Publish(new RconFrameCaptured(
-            ServerId,
-            _tenantId,
-            DateTimeOffset.UtcNow,
-            response.Identifier,
-            response.Type,
-            response.Message,
-            response.Stacktrace,
-            interactive,
-            RconEventDirection.Received));
+
+        // The one thing not stored: a background drain poll's "nothing new since last time". On a quiet server that is nearly
+        // every answer (thousands a day per server), and it carries no information the next real answer does not. Anything
+        // else - data, an error, a "lost" or "reset" flag, or a person's own command - is stored as before.
+        if (interactive || !EmptyDrainReply.IsEmpty(response.Message))
+        {
+            _ = _publishEndpoint.Publish(new RconFrameCaptured(
+                ServerId,
+                _tenantId,
+                DateTimeOffset.UtcNow,
+                response.Identifier,
+                response.Type,
+                response.Message,
+                response.Stacktrace,
+                interactive,
+                RconEventDirection.Received));
+        }
 
         // Every frame is a candidate death line - see KillFeedTextParser's remarks for why this can't
         // be narrowed to "only generic console frames" up front (the Type field's meaning isn't
