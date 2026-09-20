@@ -89,6 +89,11 @@ public sealed class ServerConnectionActor : IAsyncDisposable
     private static readonly TimeSpan MapPollInterval = TimeSpan.FromMinutes(5);
     private static readonly TimeSpan MapPollInitialDelay = TimeSpan.FromSeconds(45);
 
+    // How often the plugin is asked for the update notices UpdateChecker has reported. UpdateChecker scans on its own slow schedule
+    // (hours), so this only sets how soon a notice shows up; an unchanged list is not published again.
+    private static readonly TimeSpan UpdatesPollInterval = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan UpdatesPollInitialDelay = TimeSpan.FromSeconds(60);
+
     // Only the fields ServerInfoSnapshotCaptured actually carries - deliberately not the full
     // RustArchon.Rcon.Entities.ServerInfo shape. That type's GameTime/SaveCreatedTime use a
     // non-ISO date format requiring ServerInfoParser's custom DateTimeConverter (see ParserBase) to
@@ -119,9 +124,16 @@ public sealed class ServerConnectionActor : IAsyncDisposable
     private readonly Task _tcPollLoopTask;
     private readonly Task _positionsDrainLoopTask;
     private readonly Task _mapPollLoopTask;
+    private readonly Task _updatesPollLoopTask;
 
     // Whether the plugin last reported the map capability. Fail closed.
     private volatile bool _mapPollEnabled;
+
+    // Whether the plugin last reported the updates capability. Fail closed. The reply last published is remembered so an unchanged
+    // table is not sent again.
+    private volatile bool _updatesPollEnabled;
+    private string? _lastPublishedUpdates;
+    private bool _updatesParseFailureLogged;
     private bool _mapParseFailureLogged;
 
     // The world whose monuments were last sent to the Api ("size:seed"). They only change with a wipe, so once is enough.
@@ -196,6 +208,7 @@ public sealed class ServerConnectionActor : IAsyncDisposable
         _tcPollLoopTask = Task.Run(() => TcPollLoopAsync(_lifetimeCts.Token));
         _positionsDrainLoopTask = Task.Run(() => PositionsDrainLoopAsync(_lifetimeCts.Token));
         _mapPollLoopTask = Task.Run(() => MapPollLoopAsync(_lifetimeCts.Token));
+        _updatesPollLoopTask = Task.Run(() => UpdatesPollLoopAsync(_lifetimeCts.Token));
 
         _ = PublishStatusAsync(RconConnectionStatus.Connecting, $"Connecting to {host}:{port}", CancellationToken.None);
         if (!_client.Connect(out var startException))
@@ -738,6 +751,7 @@ public sealed class ServerConnectionActor : IAsyncDisposable
             _tcPollEnabled = false;
             _positionsDrainEnabled = false;
             _mapPollEnabled = false;
+            _updatesPollEnabled = false;
             return;
         }
 
@@ -756,6 +770,7 @@ public sealed class ServerConnectionActor : IAsyncDisposable
                 _tcPollEnabled = false;
                 _positionsDrainEnabled = false;
                 _mapPollEnabled = false;
+                _updatesPollEnabled = false;
                 await PublishDiagnosticAsync(
                     ConnectionLogLevel.Warning,
                     $"The RustArchon plugin is loaded but its archon.hello reply was not understood ({failure}); plugin features stay off.",
@@ -770,6 +785,7 @@ public sealed class ServerConnectionActor : IAsyncDisposable
             _positionsDrainEnabled = hello.RecordingEnabled
                 && hello.Capabilities.Contains(RustArchonPlugin.PositionsCapability, StringComparer.Ordinal);
             _mapPollEnabled = hello.Capabilities.Contains(RustArchonPlugin.MapCapability, StringComparer.Ordinal);
+            _updatesPollEnabled = hello.Capabilities.Contains(RustArchonPlugin.UpdatesCapability, StringComparer.Ordinal);
 
             await _publishEndpoint.Publish(
                 new ServerPluginHandshakeCaptured(
@@ -833,6 +849,79 @@ public sealed class ServerConnectionActor : IAsyncDisposable
             {
                 await LogPluginStatsAsync(cancellationToken);
             }
+        }
+    }
+
+    /// <summary>Asks the plugin for its update notices every <see cref="UpdatesPollInterval"/> while it reports the capability.</summary>
+    private async Task UpdatesPollLoopAsync(CancellationToken cancellationToken)
+    {
+        var delay = UpdatesPollInitialDelay;
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                await Task.Delay(delay, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+
+            delay = UpdatesPollInterval;
+            if (_updatesPollEnabled)
+            {
+                await ReadUpdateNoticesAsync(cancellationToken);
+            }
+        }
+    }
+
+    // Reads the plugin's update notices and publishes them when there are some and they differ from what was last sent. An empty
+    // table is never published: it means UpdateChecker has not spoken since the plugin loaded (or is not installed), and must not be
+    // taken to mean "everything is up to date".
+    private async Task ReadUpdateNoticesAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            var reply = await _client.SendCommandAsync(
+                "archon.updates", DefaultCommandTimeout, cancellationToken, RconCommandContext.Background);
+
+            if (!ArchonUpdatesParser.TryParse(reply.Message, out var updates, out var failure) || updates is null)
+            {
+                if (!_updatesParseFailureLogged)
+                {
+                    _updatesParseFailureLogged = true;
+                    _logger.LogWarning(
+                        "Server {ServerId}: the RustArchon plugin's update notices reply was not understood ({Failure}); nothing was stored.",
+                        ServerId, failure);
+                }
+
+                return;
+            }
+
+            _updatesParseFailureLogged = false;
+
+            if (updates.Count == 0 || reply.Message == _lastPublishedUpdates)
+            {
+                return;
+            }
+
+            await _publishEndpoint.Publish(
+                new PluginUpdatesCaptured(ServerId, _tenantId, updates, DateTimeOffset.UtcNow), cancellationToken);
+            _lastPublishedUpdates = reply.Message;
+        }
+        catch (InvalidOperationException)
+        {
+            // Not connected right now; the next cycle tries again.
+        }
+        catch (TimeoutException)
+        {
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Update notice read failed for server {ServerId}", ServerId);
         }
     }
 
@@ -1292,6 +1381,15 @@ public sealed class ServerConnectionActor : IAsyncDisposable
         try
         {
             await _mapPollLoopTask;
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected on shutdown.
+        }
+
+        try
+        {
+            await _updatesPollLoopTask;
         }
         catch (OperationCanceledException)
         {

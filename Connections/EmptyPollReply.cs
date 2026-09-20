@@ -29,6 +29,12 @@ public static class EmptyPollReply
             return true;
         }
 
+        if (message.Contains("\"updates\"", StringComparison.Ordinal)
+            && ArchonUpdatesParser.TryParse(message, out var notices, out _) && notices is not null)
+        {
+            return notices.Count == 0;
+        }
+
         if (!message.Contains("\"bootId\"", StringComparison.Ordinal))
         {
             return false;
