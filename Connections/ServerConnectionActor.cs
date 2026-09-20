@@ -64,6 +64,31 @@ public sealed class ServerConnectionActor : IAsyncDisposable
     private static readonly TimeSpan PluginListInitialDelay = TimeSpan.FromSeconds(20);
     private static readonly TimeSpan PluginListRetryInterval = TimeSpan.FromSeconds(30);
 
+    // How often the RustArchon plugin's combat events are collected. The plugin records continuously into a bounded
+    // buffer whatever this does, so this only sets how promptly the Panel sees them and how big each batch is - a
+    // Worker that is away for a while loses nothing until the plugin's buffer wraps (and is told when it did).
+    private static readonly TimeSpan CombatDrainInterval = TimeSpan.FromSeconds(30);
+    private const int CombatDrainBatchSize = 500;
+    private const int CombatDrainMaxRoundsPerCycle = 10;
+    private const int CombatStatsEveryNthCycle = 10;
+
+    // How often the RustArchon plugin's tool cupboard index is read while Recording is on. A base changes rarely, and
+    // each read replaces the last picture wholesale, so once a minute is plenty and cheap.
+    private static readonly TimeSpan TcPollInterval = TimeSpan.FromSeconds(60);
+    private const int TcPageSize = 200;
+    private const int TcMaxPagesPerRead = 50;
+
+    // How often the plugin's recorded player positions are collected while Recording is on. Same reasoning as combat: the
+    // plugin records into a bounded buffer regardless, so this only sets how fresh the Panel's view is.
+    private static readonly TimeSpan PositionsDrainInterval = TimeSpan.FromSeconds(30);
+    private const int PositionsDrainBatchSize = 500;
+    private const int PositionsDrainMaxRoundsPerCycle = 10;
+
+    // How often the plugin is asked about the world map. The picture changes once per wipe, so this is only how quickly a
+    // fresh one is noticed (and an upload's outcome seen); the first read comes soon after the connection is up.
+    private static readonly TimeSpan MapPollInterval = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan MapPollInitialDelay = TimeSpan.FromSeconds(45);
+
     // Only the fields ServerInfoSnapshotCaptured actually carries - deliberately not the full
     // RustArchon.Rcon.Entities.ServerInfo shape. That type's GameTime/SaveCreatedTime use a
     // non-ISO date format requiring ServerInfoParser's custom DateTimeConverter (see ParserBase) to
@@ -90,6 +115,38 @@ public sealed class ServerConnectionActor : IAsyncDisposable
     private readonly Task _playerListPollLoopTask;
     private readonly Task _serverInfoPollLoopTask;
     private readonly Task _pluginListPollLoopTask;
+    private readonly Task _combatDrainLoopTask;
+    private readonly Task _tcPollLoopTask;
+    private readonly Task _positionsDrainLoopTask;
+    private readonly Task _mapPollLoopTask;
+
+    // Whether the plugin last reported the map capability. Fail closed.
+    private volatile bool _mapPollEnabled;
+    private bool _mapParseFailureLogged;
+
+    // The world whose monuments were last sent to the Api ("size:seed"). They only change with a wipe, so once is enough.
+    private string? _monumentsSentForWorld;
+
+    // Whether the plugin last reported the positions capability AND the Recording switch on. Fail closed.
+    private volatile bool _positionsDrainEnabled;
+    private long _positionsBootId;
+    private long _positionsCursor;
+    private bool _positionsParseFailureLogged;
+
+    // Whether the plugin last reported the tcs capability AND the Recording switch on. Fail closed: false until a
+    // handshake says otherwise.
+    private volatile bool _tcPollEnabled;
+    private bool _tcParseFailureLogged;
+
+    // Whether the plugin last reported the combat capability AND the Combat log switch on: the only time draining is
+    // worth doing. Set by the handshake poll, read by the drain loop. Fail closed: false until a handshake says otherwise.
+    private volatile bool _combatDrainEnabled;
+
+    // Where the last drain left off. Actor-local and not persisted: after a Worker restart the drain starts from the
+    // beginning of the plugin's buffer, and the Api drops anything it already stored (it keys on boot and sequence).
+    private long _combatBootId;
+    private long _combatCursor;
+    private bool _combatParseFailureLogged;
 
     // Actor-local, not persisted - rebuilt from scratch every time this actor starts (a fresh worker
     // claim, or this same worker reconnecting after a restart). See PlayerListPollLoopAsync's remarks
@@ -135,6 +192,10 @@ public sealed class ServerConnectionActor : IAsyncDisposable
         _playerListPollLoopTask = Task.Run(() => PlayerListPollLoopAsync(_lifetimeCts.Token));
         _serverInfoPollLoopTask = Task.Run(() => ServerInfoPollLoopAsync(_lifetimeCts.Token));
         _pluginListPollLoopTask = Task.Run(() => PluginListPollLoopAsync(_lifetimeCts.Token));
+        _combatDrainLoopTask = Task.Run(() => CombatDrainLoopAsync(_lifetimeCts.Token));
+        _tcPollLoopTask = Task.Run(() => TcPollLoopAsync(_lifetimeCts.Token));
+        _positionsDrainLoopTask = Task.Run(() => PositionsDrainLoopAsync(_lifetimeCts.Token));
+        _mapPollLoopTask = Task.Run(() => MapPollLoopAsync(_lifetimeCts.Token));
 
         _ = PublishStatusAsync(RconConnectionStatus.Connecting, $"Connecting to {host}:{port}", CancellationToken.None);
         if (!_client.Connect(out var startException))
@@ -616,6 +677,8 @@ public sealed class ServerConnectionActor : IAsyncDisposable
             {
                 _logger.LogWarning(ex, "Failed to publish plugin list for server {ServerId}", ServerId);
             }
+
+            await PollPluginHandshakeAsync(plugins, cancellationToken);
         }
     }
 
@@ -648,6 +711,471 @@ public sealed class ServerConnectionActor : IAsyncDisposable
         return oxidePlugins.Count > 0
             ? (ServerModFramework.Oxide, oxidePlugins)
             : (ServerModFramework.None, []);
+    }
+
+    /// <summary>
+    /// Says <c>archon.hello</c> to the optional RustArchon companion plugin and publishes what it answers as
+    /// <see cref="ServerPluginHandshakeCaptured"/>. Runs on the plugin-list poll's schedule, and only when
+    /// that list <em>positively</em> shows the plugin loaded - a server that does not list it is never sent
+    /// the command, so it never sees an "Unknown command" for a plugin it does not have.
+    /// </summary>
+    /// <remarks>
+    /// Settings drift (a plugin reinstall, a reset settings file) is corrected by the Api when this message
+    /// arrives; a Panel toggle is pushed to the plugin immediately by the Api and does not wait for this poll.
+    /// </remarks>
+    private async Task PollPluginHandshakeAsync(IReadOnlyList<ServerPluginInfo> plugins, CancellationToken cancellationToken)
+    {
+        if (!ArchonHelloParser.IsPluginListed(plugins))
+        {
+            _combatDrainEnabled = false;
+            _tcPollEnabled = false;
+            _positionsDrainEnabled = false;
+            _mapPollEnabled = false;
+            return;
+        }
+
+        try
+        {
+            // Background: this is our own bookkeeping poll, not something a person typed - same reasoning as
+            // the plugin-list/playerlist/serverinfo polls.
+            var reply = await _client.SendCommandAsync(
+                "archon.hello", DefaultCommandTimeout, cancellationToken, RconCommandContext.Background);
+
+            if (!ArchonHelloParser.TryParse(reply.Message, out var hello, out var failure) || hello is null)
+            {
+                // The plugin is listed but did not give an answer we understand (an old build, a broken one).
+                // Not publishing means every plugin-only feature stays off, which is the safe direction.
+                _combatDrainEnabled = false;
+                _tcPollEnabled = false;
+                _positionsDrainEnabled = false;
+                _mapPollEnabled = false;
+                await PublishDiagnosticAsync(
+                    ConnectionLogLevel.Warning,
+                    $"The RustArchon plugin is loaded but its archon.hello reply was not understood ({failure}); plugin features stay off.",
+                    cancellationToken);
+                return;
+            }
+
+            _combatDrainEnabled = hello.CombatLogEnabled
+                && hello.Capabilities.Contains(RustArchonPlugin.CombatCapability, StringComparer.Ordinal);
+            _tcPollEnabled = hello.RecordingEnabled
+                && hello.Capabilities.Contains(RustArchonPlugin.TcsCapability, StringComparer.Ordinal);
+            _positionsDrainEnabled = hello.RecordingEnabled
+                && hello.Capabilities.Contains(RustArchonPlugin.PositionsCapability, StringComparer.Ordinal);
+            _mapPollEnabled = hello.Capabilities.Contains(RustArchonPlugin.MapCapability, StringComparer.Ordinal);
+
+            await _publishEndpoint.Publish(
+                new ServerPluginHandshakeCaptured(
+                    ServerId,
+                    _tenantId,
+                    hello.ProtocolVersion,
+                    hello.PluginVersion,
+                    hello.Capabilities,
+                    hello.RecordingEnabled,
+                    hello.CombatLogEnabled,
+                    hello.SettingsPersisted,
+                    DateTimeOffset.UtcNow,
+                    hello.SigningState,
+                    hello.SigningKeyFingerprint),
+                cancellationToken);
+        }
+        catch (InvalidOperationException)
+        {
+            // Not connected right now - the next poll tries again.
+        }
+        catch (TimeoutException)
+        {
+            // No reply in time - treated the same as not connected.
+        }
+        catch (OperationCanceledException)
+        {
+            // Shutting down - the loop's next delay ends it.
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "RustArchon plugin handshake failed for server {ServerId}", ServerId);
+        }
+    }
+
+    /// <summary>
+    /// Collects the plugin's combat events every <see cref="CombatDrainInterval"/> while it reports the capability and
+    /// the switch on, and hands them to the Api. Silent when off: nothing is asked of the plugin.
+    /// </summary>
+    private async Task CombatDrainLoopAsync(CancellationToken cancellationToken)
+    {
+        var cycles = 0;
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                await Task.Delay(CombatDrainInterval, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+
+            if (!_combatDrainEnabled)
+            {
+                continue;
+            }
+
+            await DrainCombatEventsAsync(cancellationToken);
+
+            if (++cycles % CombatStatsEveryNthCycle == 0)
+            {
+                await LogPluginStatsAsync(cancellationToken);
+            }
+        }
+    }
+
+    /// <summary>Asks the plugin about the world map every <see cref="MapPollInterval"/> while it reports the capability.</summary>
+    private async Task MapPollLoopAsync(CancellationToken cancellationToken)
+    {
+        var delay = MapPollInitialDelay;
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                await Task.Delay(delay, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+
+            delay = MapPollInterval;
+            if (_mapPollEnabled)
+            {
+                await ReadMapStatusAsync(cancellationToken);
+            }
+        }
+    }
+
+    // Reads the plugin's map status and publishes it. The first time a world is seen the monument list is fetched and sent
+    // along (a failure to get it does not stop the status: it is asked for again next time).
+    private async Task ReadMapStatusAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            var reply = await _client.SendCommandAsync(
+                "archon.map.status", DefaultCommandTimeout, cancellationToken, RconCommandContext.Background);
+
+            if (!ArchonMapParser.TryParseStatus(reply.Message, out var status, out var failure) || status is null)
+            {
+                if (!_mapParseFailureLogged)
+                {
+                    _mapParseFailureLogged = true;
+                    _logger.LogWarning(
+                        "Server {ServerId}: the RustArchon plugin's map status reply was not understood ({Failure}); nothing was stored.",
+                        ServerId, failure);
+                }
+
+                return;
+            }
+
+            _mapParseFailureLogged = false;
+
+            // Nothing to report until the game has loaded a world.
+            if (!status.WorldKnown)
+            {
+                return;
+            }
+
+            string? monumentsJson = null;
+            var world = $"{status.WorldSize}:{status.WorldSeed}";
+            if (world != _monumentsSentForWorld)
+            {
+                monumentsJson = await ReadMonumentsAsync(cancellationToken);
+            }
+
+            await _publishEndpoint.Publish(
+                new PluginMapStatusCaptured(
+                    ServerId, _tenantId, status.WorldSize, status.WorldSeed, status.FileName, status.Exists, status.Bytes,
+                    status.UploadState, monumentsJson, DateTimeOffset.UtcNow),
+                cancellationToken);
+
+            if (monumentsJson is not null)
+            {
+                _monumentsSentForWorld = world;
+            }
+        }
+        catch (InvalidOperationException)
+        {
+            // Not connected right now; the next cycle tries again.
+        }
+        catch (TimeoutException)
+        {
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Map status read failed for server {ServerId}", ServerId);
+        }
+    }
+
+    private async Task<string?> ReadMonumentsAsync(CancellationToken cancellationToken)
+    {
+        var reply = await _client.SendCommandAsync(
+            "archon.map.monuments", DefaultCommandTimeout, cancellationToken, RconCommandContext.Background);
+
+        if (ArchonMapParser.TryParseMonuments(reply.Message, out var monuments, out var failure))
+        {
+            return monuments;
+        }
+
+        _logger.LogWarning("Server {ServerId}: the RustArchon plugin's monument list was not understood ({Failure}).", ServerId, failure);
+        return null;
+    }
+
+    /// <summary>Collects the plugin's recorded positions every <see cref="PositionsDrainInterval"/> while it reports the capability and Recording is on.</summary>
+    private async Task PositionsDrainLoopAsync(CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                await Task.Delay(PositionsDrainInterval, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+
+            if (_positionsDrainEnabled)
+            {
+                await DrainPositionsAsync(cancellationToken);
+            }
+        }
+    }
+
+    /// <summary>Reads the plugin's tool cupboard index every <see cref="TcPollInterval"/> while it reports the capability and Recording is on.</summary>
+    private async Task TcPollLoopAsync(CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                await Task.Delay(TcPollInterval, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+
+            if (_tcPollEnabled)
+            {
+                await ReadTcIndexAsync(cancellationToken);
+            }
+        }
+    }
+
+    // Walks the plugin's pages (each names where the next starts) and publishes the whole list as one snapshot. Any page that
+    // fails or is not understood abandons the read: a snapshot missing a page would look like bases that vanished.
+    private async Task ReadTcIndexAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            var all = new List<string>();
+            var ready = false;
+            var offset = 0;
+
+            for (var pageNumber = 0; pageNumber < TcMaxPagesPerRead; pageNumber++)
+            {
+                var reply = await _client.SendCommandAsync(
+                    $"archon.tcs {offset} {TcPageSize}", DefaultCommandTimeout, cancellationToken, RconCommandContext.Background);
+
+                if (!ArchonTcsParser.TryParse(reply.Message, out var page, out var failure) || page is null)
+                {
+                    if (!_tcParseFailureLogged)
+                    {
+                        _tcParseFailureLogged = true;
+                        _logger.LogWarning(
+                            "Server {ServerId}: the RustArchon plugin's tool cupboard reply was not understood ({Failure}); nothing was stored.",
+                            ServerId, failure);
+                    }
+
+                    return;
+                }
+
+                _tcParseFailureLogged = false;
+                all.AddRange(page.TcsRaw);
+                ready = page.Ready;
+
+                if (page.Next >= page.Total || page.Next <= offset)
+                {
+                    await _publishEndpoint.Publish(
+                        new PluginTcSnapshotCaptured(
+                            ServerId, _tenantId, ready, all.Count, "[" + string.Join(",", all) + "]", DateTimeOffset.UtcNow),
+                        cancellationToken);
+                    return;
+                }
+
+                offset = page.Next;
+            }
+
+            _logger.LogWarning("Server {ServerId}: the tool cupboard list did not finish within {Pages} pages; nothing was stored.", ServerId, TcMaxPagesPerRead);
+        }
+        catch (InvalidOperationException)
+        {
+            // Not connected right now; the next cycle tries again.
+        }
+        catch (TimeoutException)
+        {
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Tool cupboard read failed for server {ServerId}", ServerId);
+        }
+    }
+
+    // Drains until caught up, or a bounded number of rounds per cycle so one very busy server cannot monopolize the loop.
+    private async Task DrainCombatEventsAsync(CancellationToken cancellationToken)
+    {
+        for (var round = 0; round < CombatDrainMaxRoundsPerCycle && !cancellationToken.IsCancellationRequested; round++)
+        {
+            try
+            {
+                var reply = await _client.SendCommandAsync(
+                    $"archon.events.drain {_combatBootId} {_combatCursor} {CombatDrainBatchSize}",
+                    DefaultCommandTimeout, cancellationToken, RconCommandContext.Background);
+
+                if (!ArchonEventsParser.TryParse(reply.Message, out var drain, out var failure) || drain is null)
+                {
+                    // Once per actor: a plugin that answers in a way we do not understand would otherwise log every 30 s.
+                    if (!_combatParseFailureLogged)
+                    {
+                        _combatParseFailureLogged = true;
+                        _logger.LogWarning(
+                            "Server {ServerId}: the RustArchon plugin's combat drain reply was not understood ({Failure}); nothing was stored.",
+                            ServerId, failure);
+                    }
+
+                    return;
+                }
+
+                _combatParseFailureLogged = false;
+
+                if (drain.Count > 0)
+                {
+                    // Publish BEFORE moving the cursor: if this throws the same batch is asked for again, and the Api
+                    // drops what it already has, so nothing is lost and nothing is stored twice.
+                    await _publishEndpoint.Publish(
+                        new PluginCombatEventsCaptured(
+                            ServerId, _tenantId, drain.BootId, drain.Reset, drain.Lost,
+                            drain.FirstSequence, drain.LastSequence, drain.Count, drain.EventsJson, DateTimeOffset.UtcNow),
+                        cancellationToken);
+                }
+
+                _combatBootId = drain.BootId;
+                _combatCursor = drain.Cursor;
+
+                if (drain.Cursor >= drain.Head)
+                {
+                    return; // caught up
+                }
+            }
+            catch (InvalidOperationException)
+            {
+                return; // not connected right now; the next cycle tries again
+            }
+            catch (TimeoutException)
+            {
+                return;
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Combat event drain failed for server {ServerId}", ServerId);
+                return;
+            }
+        }
+    }
+
+    // Same shape as the combat drain: publish BEFORE moving the cursor, bounded rounds per cycle, the Api drops repeats.
+    private async Task DrainPositionsAsync(CancellationToken cancellationToken)
+    {
+        for (var round = 0; round < PositionsDrainMaxRoundsPerCycle && !cancellationToken.IsCancellationRequested; round++)
+        {
+            try
+            {
+                var reply = await _client.SendCommandAsync(
+                    $"archon.positions.drain {_positionsBootId} {_positionsCursor} {PositionsDrainBatchSize}",
+                    DefaultCommandTimeout, cancellationToken, RconCommandContext.Background);
+
+                if (!ArchonPositionsParser.TryParse(reply.Message, out var drain, out var failure) || drain is null)
+                {
+                    if (!_positionsParseFailureLogged)
+                    {
+                        _positionsParseFailureLogged = true;
+                        _logger.LogWarning(
+                            "Server {ServerId}: the RustArchon plugin's positions drain reply was not understood ({Failure}); nothing was stored.",
+                            ServerId, failure);
+                    }
+
+                    return;
+                }
+
+                _positionsParseFailureLogged = false;
+
+                if (drain.Count > 0)
+                {
+                    await _publishEndpoint.Publish(
+                        new PluginPositionsCaptured(
+                            ServerId, _tenantId, drain.BootId, drain.Reset, drain.Lost,
+                            drain.FirstSequence, drain.LastSequence, drain.Count, drain.EventsJson, DateTimeOffset.UtcNow),
+                        cancellationToken);
+                }
+
+                _positionsBootId = drain.BootId;
+                _positionsCursor = drain.Cursor;
+
+                if (drain.Cursor >= drain.Head)
+                {
+                    return; // caught up
+                }
+            }
+            catch (InvalidOperationException)
+            {
+                return;
+            }
+            catch (TimeoutException)
+            {
+                return;
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Position drain failed for server {ServerId}", ServerId);
+                return;
+            }
+        }
+    }
+
+    // The plugin's own cost counters (hook fires, recorded, buffered), logged now and then for measuring the hooks.
+    private async Task LogPluginStatsAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            var reply = await _client.SendCommandAsync(
+                "archon.stats", DefaultCommandTimeout, cancellationToken, RconCommandContext.Background);
+            _logger.LogInformation("Server {ServerId}: RustArchon plugin stats {Stats}", ServerId, reply.Message);
+        }
+        catch (Exception)
+        {
+            // Purely informational; never let it disturb the drain.
+        }
     }
 
     private async Task PublishStatusAsync(RconConnectionStatus status, string? detail, CancellationToken cancellationToken)
@@ -721,6 +1249,42 @@ public sealed class ServerConnectionActor : IAsyncDisposable
         try
         {
             await _pluginListPollLoopTask;
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected on shutdown.
+        }
+
+        try
+        {
+            await _combatDrainLoopTask;
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected on shutdown.
+        }
+
+        try
+        {
+            await _tcPollLoopTask;
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected on shutdown.
+        }
+
+        try
+        {
+            await _positionsDrainLoopTask;
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected on shutdown.
+        }
+
+        try
+        {
+            await _mapPollLoopTask;
         }
         catch (OperationCanceledException)
         {
