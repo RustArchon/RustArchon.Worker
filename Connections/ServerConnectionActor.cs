@@ -670,50 +670,92 @@ public sealed class ServerConnectionActor : IAsyncDisposable
                 break;
             }
 
-            // Pessimistic until this attempt actually gets an answer from the server.
-            delay = PluginListRetryInterval;
-
-            ServerModFramework framework;
-            IReadOnlyList<ServerPluginInfo> plugins;
-            IReadOnlyList<ServerPluginFailure>? failures;
+            bool connected;
             try
             {
-                (framework, plugins, failures) = await QueryPluginListAsync(cancellationToken);
-            }
-            catch (InvalidOperationException)
-            {
-                continue; // Not connected right now - retried on the short interval.
-            }
-            catch (TimeoutException)
-            {
-                continue; // No response in time - treated the same as "not connected right now".
+                connected = await PollPluginsOnceAsync(cancellationToken);
             }
             catch (OperationCanceledException)
             {
                 break;
             }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Plugin-list poll failed for server {ServerId}", ServerId);
-                await PublishDiagnosticAsync(ConnectionLogLevel.Warning, $"Plugin-list poll failed: {ex.Message}", cancellationToken);
-                continue;
-            }
 
-            delay = PluginListPollInterval;
-
-            try
-            {
-                await _publishEndpoint.Publish(
-                    new ServerPluginsCaptured(ServerId, _tenantId, framework, plugins, DateTimeOffset.UtcNow, failures),
-                    cancellationToken);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Failed to publish plugin list for server {ServerId}", ServerId);
-            }
-
-            await PollPluginHandshakeAsync(plugins, cancellationToken);
+            // Pessimistic (retried sooner) unless that attempt actually got an answer from the server.
+            delay = connected ? PluginListPollInterval : PluginListRetryInterval;
         }
+    }
+
+    /// <summary>
+    /// One round of the plugin-list poll and, if the plugin is listed, its <c>archon.hello</c> handshake - the body <see cref="PluginListPollLoopAsync"/>
+    /// runs on its own timer, factored out so <see cref="PollNowAsync"/> can run the identical round on demand. Returns whether the server answered
+    /// (an unreachable server, or a timeout, is not an error - <c>false</c> just means "try again later", same as the background loop already treats it).
+    /// </summary>
+    private async Task<bool> PollPluginsOnceAsync(CancellationToken cancellationToken)
+    {
+        ServerModFramework framework;
+        IReadOnlyList<ServerPluginInfo> plugins;
+        IReadOnlyList<ServerPluginFailure>? failures;
+        try
+        {
+            (framework, plugins, failures) = await QueryPluginListAsync(cancellationToken);
+        }
+        catch (InvalidOperationException)
+        {
+            return false; // Not connected right now.
+        }
+        catch (TimeoutException)
+        {
+            return false; // No response in time - treated the same as "not connected right now".
+        }
+        catch (OperationCanceledException)
+        {
+            // Shutting down (or, for PollNowAsync, the caller's own cancellation) - not a poll failure, so no warning and no diagnostic log entry;
+            // the loop's own wrapper treats this as "stop", same as before this method was factored out.
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Plugin-list poll failed for server {ServerId}", ServerId);
+            await PublishDiagnosticAsync(ConnectionLogLevel.Warning, $"Plugin-list poll failed: {ex.Message}", cancellationToken);
+            return false;
+        }
+
+        try
+        {
+            await _publishEndpoint.Publish(
+                new ServerPluginsCaptured(ServerId, _tenantId, framework, plugins, DateTimeOffset.UtcNow, failures),
+                cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to publish plugin list for server {ServerId}", ServerId);
+        }
+
+        await PollPluginHandshakeAsync(plugins, cancellationToken);
+        return true;
+    }
+
+    /// <summary>
+    /// Runs one or more polls right now, on top of their own background schedule - see <see cref="PollServerNow"/>'s remarks for why this exists and
+    /// why it deliberately does not touch that schedule's timer. Unknown entries in <paramref name="polls"/> are ignored. When both
+    /// <see cref="PollServerNowKinds.Plugins"/> and <see cref="PollServerNowKinds.Updates"/> are asked for, plugins runs first, since it is what
+    /// refreshes <see cref="_updatesPollEnabled"/> (the capability the plugin reported at its last handshake) in the first place.
+    /// </summary>
+    public async Task<bool> PollNowAsync(IReadOnlyCollection<string> polls, CancellationToken cancellationToken)
+    {
+        var connected = false;
+
+        if (polls.Contains(PollServerNowKinds.Plugins))
+        {
+            connected |= await PollPluginsOnceAsync(cancellationToken);
+        }
+
+        if (polls.Contains(PollServerNowKinds.Updates) && _updatesPollEnabled)
+        {
+            connected |= await ReadUpdateNoticesAsync(cancellationToken);
+        }
+
+        return connected;
     }
 
     /// <summary>
@@ -894,8 +936,8 @@ public sealed class ServerConnectionActor : IAsyncDisposable
 
     // Reads the plugin's update notices and publishes them when there are some and they differ from what was last sent. An empty
     // table is never published: it means UpdateChecker has not spoken since the plugin loaded (or is not installed), and must not be
-    // taken to mean "everything is up to date".
-    private async Task ReadUpdateNoticesAsync(CancellationToken cancellationToken)
+    // taken to mean "everything is up to date". Returns whether the server answered at all (used by PollNowAsync; the scheduled loop ignores it).
+    private async Task<bool> ReadUpdateNoticesAsync(CancellationToken cancellationToken)
     {
         try
         {
@@ -912,33 +954,37 @@ public sealed class ServerConnectionActor : IAsyncDisposable
                         ServerId, failure);
                 }
 
-                return;
+                return true;
             }
 
             _updatesParseFailureLogged = false;
 
             if (updates.Count == 0 || reply.Message == _lastPublishedUpdates)
             {
-                return;
+                return true;
             }
 
             await _publishEndpoint.Publish(
                 new PluginUpdatesCaptured(ServerId, _tenantId, updates, DateTimeOffset.UtcNow), cancellationToken);
             _lastPublishedUpdates = reply.Message;
+            return true;
         }
         catch (InvalidOperationException)
         {
-            // Not connected right now; the next cycle tries again.
+            return false; // Not connected right now; the next cycle tries again.
         }
         catch (TimeoutException)
         {
+            return false;
         }
         catch (OperationCanceledException)
         {
+            return false; // Shutting down, or the caller's own cancellation - same as every other read loop in this class.
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Update notice read failed for server {ServerId}", ServerId);
+            return false;
         }
     }
 
