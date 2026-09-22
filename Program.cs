@@ -89,6 +89,7 @@ builder.Services.AddMassTransit(x =>
     x.AddConsumer<ConnectToServerConsumer>();
     x.AddConsumer<ServerLifecycleConsumer>();
     x.AddConsumer<SendRconCommandConsumer>();
+    x.AddConsumer<PollServerNowConsumer>();
     x.AddConsumer<EmailRequestedConsumer>();
     x.AddConsumer<SendTestEmailConsumer>();
     x.AddConsumer<TicketEventConsumer>();
@@ -128,6 +129,13 @@ builder.Services.AddMassTransit(x =>
             e.Durable = false;
             e.AutoDelete = true;
             e.ConfigureConsumer<SendRconCommandConsumer>(context);
+        });
+
+        cfg.ReceiveEndpoint($"rustarchon-worker-poll-{workerId}", e =>
+        {
+            e.Durable = false;
+            e.AutoDelete = true;
+            e.ConfigureConsumer<PollServerNowConsumer>(context);
         });
 
         // Competing consumer like ConnectToServer above - one shared, durable queue (explicit here,
