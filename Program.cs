@@ -4,10 +4,12 @@ using MassTransit;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using RustArchon.Diagnostics;
 using RustArchon.Worker;
 using RustArchon.Worker.Configuration;
 using RustArchon.Worker.Connections;
 using RustArchon.Worker.Email;
+using RustArchon.Worker.Logging;
 using RustArchon.Worker.Messaging;
 using RustArchon.Worker.Security;
 using RustArchon.Worker.Ticketing;
@@ -37,6 +39,16 @@ var internalApiOptions = builder.Configuration.GetSection("Api").Get<InternalApi
 // InternalApiOptions's remarks for why this isn't a property on that class.
 var internalApiKey = builder.Configuration["RUSTARCHON_INTERNAL_API_KEY"]
     ?? throw new InvalidOperationException("RUSTARCHON_INTERNAL_API_KEY configuration is missing.");
+
+// ============================================
+// 1b. DIAGNOSTIC LOG BUFFER
+// ============================================
+// Every entry at Debug and above is kept in memory (whatever the console shows) and forwarded to the Api in batches over the bus, so it can be
+// read through the Api's diagnostic log endpoint. See ADR-0006 and LogForwarder's remarks.
+var logRing = new LogRing("worker", Guid.NewGuid().ToString("N"), WorkerLogging.BufferCapacity);
+builder.Logging.AddDiagnosticRing(logRing, WorkerLogging.ExcludeFromCapture);
+builder.Services.AddSingleton<ILogBatchPublisher, MassTransitLogBatchPublisher>();
+builder.Services.AddHostedService<LogForwarder>();
 
 // ============================================
 // 2. WORKER IDENTITY + CONNECTION STATE

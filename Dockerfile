@@ -10,11 +10,13 @@ WORKDIR /src
 
 COPY ["RustArchon.Worker/RustArchon.Worker.csproj", "RustArchon.Worker/"]
 COPY ["RustArchon.Messaging/RustArchon.Messaging.csproj", "RustArchon.Messaging/"]
+COPY ["RustArchon.Diagnostics/RustArchon.Diagnostics.csproj", "RustArchon.Diagnostics/"]
 COPY ["RustArchon.Rcon/RustArchon.Rcon.csproj", "RustArchon.Rcon/"]
 RUN dotnet restore "RustArchon.Worker/RustArchon.Worker.csproj"
 
 COPY ["RustArchon.Worker/", "RustArchon.Worker/"]
 COPY ["RustArchon.Messaging/", "RustArchon.Messaging/"]
+COPY ["RustArchon.Diagnostics/", "RustArchon.Diagnostics/"]
 COPY ["RustArchon.Rcon/", "RustArchon.Rcon/"]
 WORKDIR "/src/RustArchon.Worker"
 RUN dotnet build "RustArchon.Worker.csproj" -c $BUILD_CONFIGURATION -o /app/build --no-restore
