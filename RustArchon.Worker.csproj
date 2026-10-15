@@ -20,6 +20,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\RustArchon.Diagnostics\RustArchon.Diagnostics.csproj" />
     <ProjectReference Include="..\RustArchon.Messaging\RustArchon.Messaging.csproj" />
     <ProjectReference Include="..\RustArchon.Rcon\RustArchon.Rcon.csproj" />
   </ItemGroup>
